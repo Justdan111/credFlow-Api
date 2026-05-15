@@ -1,0 +1,29 @@
+# Secrets / local config — NEVER commit
+.env
+.env.local
+.env.*.local
+
+# Go build artifacts
+/bin/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test + coverage
+*.test
+*.out
+coverage.html
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
