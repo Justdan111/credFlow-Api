@@ -12,16 +12,20 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"github.com/Justdan111/credflow-api/internal/auth"
+	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
 	"github.com/Justdan111/credflow-api/pkg/database"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
 type App struct {
-	DB *pgxpool.Pool
+	DB   *pgxpool.Pool
+	JWT  *auth.JWTService
+	Auth *auth.Service
 }
 
 func main() {
@@ -30,6 +34,8 @@ func main() {
 	}
 
 	dbURL := mustEnv("DATABASE_URL")
+	jwtSecret := mustEnv("JWT_SECRET")
+	jwtTTL := envDuration("JWT_TTL", 24*time.Hour)
 	maxConns := envInt32("DB_MAX_CONNS", 10)
 	minConns := envInt32("DB_MIN_CONNS", 2)
 	port := envString("PORT", "8080")
@@ -51,17 +57,32 @@ func main() {
 	}
 	defer pool.Close()
 
-	app := &App{DB: pool}
+	jwtSvc := auth.NewJWTService(jwtSecret, jwtTTL)
+	authRepo := auth.NewRepository()
+	authSvc := auth.NewService(pool, authRepo, jwtSvc)
+	authHandler := auth.NewHandler(authSvc)
+
+	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Logger)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.Timeout(60 * time.Second))
 
 	r.Get("/health", app.handleHealth)
 	r.Get("/health/db", app.handleHealthDB)
+
+	r.Route("/api/auth", func(r chi.Router) {
+		r.Post("/register", authHandler.Register)
+		r.Post("/login", authHandler.Login)
+
+		r.Group(func(r chi.Router) {
+			r.Use(appmiddleware.RequireAuth(jwtSvc))
+			r.Get("/me", authHandler.Me)
+		})
+	})
 
 	addr := ":" + port
 	srv := &http.Server{
@@ -112,10 +133,7 @@ func (a *App) handleHealthDB(w http.ResponseWriter, r *http.Request) {
 		response.Fail(w, http.StatusServiceUnavailable, "database unreachable")
 		return
 	}
-	response.Success(w, http.StatusOK, map[string]string{
-		"status": "ok",
-		"db":     "ok",
-	})
+	response.Success(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
 }
 
 func envString(key, fallback string) string {
@@ -135,6 +153,18 @@ func envInt32(key string, fallback int32) int32 {
 		log.Fatalf("env %s: invalid int32 %q: %v", key, v, err)
 	}
 	return int32(n)
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("env %s: invalid duration %q: %v", key, v, err)
+	}
+	return d
 }
 
 func mustEnv(key string) string {

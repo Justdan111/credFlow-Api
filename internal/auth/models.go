@@ -39,5 +39,5 @@ type LoginRequest struct {
 type AuthResponse struct {
 	User     User     `json:"user"`
 	Business Business `json:"business"`
-	Token    string   `json:"token"`
+	Token    string   `json:"token,omitempty"`
 }
