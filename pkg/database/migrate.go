@@ -11,9 +11,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
-// RunMigrations applies any pending up-migrations from migrationsPath
-// against dbURL. Safe to call from multiple processes concurrently —
-// golang-migrate uses a Postgres advisory lock internally.
+
 func RunMigrations(migrationsPath, dbURL string) error {
 	pgxURL, err := toPgx5URL(dbURL)
 	if err != nil {
