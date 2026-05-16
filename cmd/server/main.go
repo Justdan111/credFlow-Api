@@ -17,6 +17,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/Justdan111/credflow-api/internal/auth"
+	"github.com/Justdan111/credflow-api/internal/customers"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
 	"github.com/Justdan111/credflow-api/pkg/database"
 	"github.com/Justdan111/credflow-api/pkg/response"
@@ -62,6 +63,10 @@ func main() {
 	authSvc := auth.NewService(pool, authRepo, jwtSvc)
 	authHandler := auth.NewHandler(authSvc)
 
+	customerRepo := customers.NewRepository(pool)
+	customerSvc := customers.NewService(customerRepo)
+	customerHandler := customers.NewHandler(customerSvc)
+
 	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
 	r := chi.NewRouter()
@@ -82,6 +87,15 @@ func main() {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
 			r.Get("/me", authHandler.Me)
 		})
+	})
+
+	r.Route("/api/customers", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/", customerHandler.List)
+		r.Post("/", customerHandler.Create)
+		r.Get("/{customerId}", customerHandler.Get)
+		r.Patch("/{customerId}", customerHandler.Update)
+		r.Delete("/{customerId}", customerHandler.Delete)
 	})
 
 	addr := ":" + port
