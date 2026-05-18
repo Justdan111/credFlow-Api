@@ -18,6 +18,7 @@ import (
 
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/internal/customers"
+	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
 	"github.com/Justdan111/credflow-api/pkg/database"
 	"github.com/Justdan111/credflow-api/pkg/response"
@@ -67,6 +68,10 @@ func main() {
 	customerSvc := customers.NewService(customerRepo)
 	customerHandler := customers.NewHandler(customerSvc)
 
+	debtRepo := debts.NewRepository(pool)
+	debtSvc := debts.NewService(debtRepo)
+	debtHandler := debts.NewHandler(debtSvc)
+
 	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
 	r := chi.NewRouter()
@@ -96,6 +101,17 @@ func main() {
 		r.Get("/{customerId}", customerHandler.Get)
 		r.Patch("/{customerId}", customerHandler.Update)
 		r.Delete("/{customerId}", customerHandler.Delete)
+		r.Get("/{customerId}/debts", debtHandler.ListByCustomer)
+	})
+
+	r.Route("/api/debts", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/", debtHandler.List)
+		r.Post("/", debtHandler.Create)
+		r.Get("/{debtId}", debtHandler.Get)
+		r.Patch("/{debtId}", debtHandler.Update)
+		r.Delete("/{debtId}", debtHandler.Delete)
+		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
 	})
 
 	addr := ":" + port
