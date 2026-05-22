@@ -23,6 +23,7 @@ import (
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
+	"github.com/Justdan111/credflow-api/internal/payments"
 	"github.com/Justdan111/credflow-api/internal/testutil"
 )
 
@@ -32,7 +33,7 @@ import (
 func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewTestDB(t)
-	testutil.Truncate(t, pool, "debts", "customers", "users", "businesses")
+	testutil.Truncate(t, pool, "payments", "debts", "customers", "users", "businesses")
 
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
@@ -40,7 +41,9 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	authHandler := auth.NewHandler(authSvc)
 
 	customerHandler := customers.NewHandler(customers.NewService(customers.NewRepository(pool)))
-	debtHandler := debts.NewHandler(debts.NewService(debts.NewRepository(pool)))
+	debtRepo := debts.NewRepository(pool)
+	debtHandler := debts.NewHandler(debts.NewService(debtRepo))
+	paymentHandler := payments.NewHandler(payments.NewService(payments.NewRepository(pool)), debtRepo)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.Recoverer)
@@ -61,6 +64,7 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		r.Patch("/{customerId}", customerHandler.Update)
 		r.Delete("/{customerId}", customerHandler.Delete)
 		r.Get("/{customerId}/debts", debtHandler.ListByCustomer)
+		r.Get("/{customerId}/payments", paymentHandler.ListByCustomer)
 	})
 	r.Route("/api/debts", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
@@ -70,6 +74,14 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		r.Patch("/{debtId}", debtHandler.Update)
 		r.Delete("/{debtId}", debtHandler.Delete)
 		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
+		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
+	})
+	r.Route("/api/payments", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/", paymentHandler.List)
+		r.Post("/", paymentHandler.Create)
+		r.Get("/{paymentId}", paymentHandler.Get)
+		r.Delete("/{paymentId}", paymentHandler.Delete)
 	})
 
 	srv := httptest.NewServer(r)
