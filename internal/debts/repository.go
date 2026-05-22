@@ -30,20 +30,21 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 //   amount_paid       = SUM of active payments against this debt (0 if none)
 //   amount_remaining  = 0 when administratively marked paid, otherwise amount - amount_paid
 //   overdue           = due_date is past and the debt isn't paid
-// The amount_paid subquery is correlated to the row's id. It runs once per
-// row and uses the payments_debt_id_active_idx index — cheap at our scale.
+// The amount_paid subquery is correlated against the outer row by debts.id —
+// using the bare table name works in SELECT, INSERT...RETURNING, and
+// UPDATE...RETURNING contexts uniformly.
 const debtSelect = `
-	d.id, d.business_id, d.customer_id, d.amount,
+	id, business_id, customer_id, amount,
 	COALESCE((SELECT SUM(p.amount) FROM payments p
-	          WHERE p.debt_id = d.id AND p.deleted_at IS NULL), 0) AS amount_paid,
+	          WHERE p.debt_id = debts.id AND p.deleted_at IS NULL), 0) AS amount_paid,
 	CASE
-	    WHEN d.status = 'paid' THEN 0
-	    ELSE d.amount - COALESCE((SELECT SUM(p.amount) FROM payments p
-	                              WHERE p.debt_id = d.id AND p.deleted_at IS NULL), 0)
+	    WHEN status = 'paid' THEN 0
+	    ELSE amount - COALESCE((SELECT SUM(p.amount) FROM payments p
+	                            WHERE p.debt_id = debts.id AND p.deleted_at IS NULL), 0)
 	END AS amount_remaining,
-	d.description, d.status,
-	(d.due_date < CURRENT_DATE AND d.status <> 'paid') AS overdue,
-	d.issued_date, d.due_date, d.paid_at, d.created_at, d.updated_at
+	description, status,
+	(due_date < CURRENT_DATE AND status <> 'paid') AS overdue,
+	issued_date, due_date, paid_at, created_at, updated_at
 `
 
 func scanDebt(row pgx.Row) (Debt, error) {
