@@ -3,19 +3,20 @@ package debts
 import "time"
 
 type Debt struct {
-	ID              string    `json:"id"`
-	BusinessID      string    `json:"businessId"`
-	CustomerID      string    `json:"customerId"`
-	Amount          float64   `json:"amount"`
-	AmountRemaining float64   `json:"amountRemaining"`
-	Description     *string   `json:"description,omitempty"`
-	Status          string    `json:"status"`
-	Overdue         bool      `json:"overdue"`
-	IssuedDate      time.Time `json:"issuedDate"`
-	DueDate         time.Time `json:"dueDate"`
+	ID              string     `json:"id"`
+	BusinessID      string     `json:"businessId"`
+	CustomerID      string     `json:"customerId"`
+	Amount          float64    `json:"amount"`
+	AmountPaid      float64    `json:"amountPaid"`      // SUM of active payments against this debt
+	AmountRemaining float64    `json:"amountRemaining"` // derived: see repository
+	Description     *string    `json:"description,omitempty"`
+	Status          string     `json:"status"`
+	Overdue         bool       `json:"overdue"`
+	IssuedDate      time.Time  `json:"issuedDate"`
+	DueDate         time.Time  `json:"dueDate"`
 	PaidAt          *time.Time `json:"paidAt,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	UpdatedAt       time.Time  `json:"updatedAt"`
 }
 
 type CreateRequest struct {
