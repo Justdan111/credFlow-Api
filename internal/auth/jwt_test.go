@@ -8,6 +8,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+
 func TestJWT_mintAndVerify(t *testing.T) {
 	svc := NewJWTService("test-secret-please-do-not-use-in-prod", time.Hour)
 
