@@ -53,7 +53,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (AuthRespon
 		if err != nil {
 			return fmt.Errorf("create business: %w", err)
 		}
-		user, err = s.repo.CreateUser(ctx, tx, biz.ID, req.Email, hash, req.Name, "owner")
+		user, err = s.repo.CreateUser(ctx, tx, biz.ID, req.Email, hash, req.Name, RoleOwner)
 		if err != nil {
 			return err
 		}

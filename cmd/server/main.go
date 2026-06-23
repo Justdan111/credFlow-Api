@@ -99,13 +99,16 @@ func main() {
 		})
 	})
 
+	ownerAdmin := appmiddleware.RequireRole(auth.RoleOwner, auth.RoleAdmin)
+	ownerOnly := appmiddleware.RequireRole(auth.RoleOwner)
+
 	r.Route("/api/customers", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
 		r.Get("/", customerHandler.List)
 		r.Post("/", customerHandler.Create)
 		r.Get("/{customerId}", customerHandler.Get)
 		r.Patch("/{customerId}", customerHandler.Update)
-		r.Delete("/{customerId}", customerHandler.Delete)
+		r.With(ownerAdmin).Delete("/{customerId}", customerHandler.Delete)
 		r.Get("/{customerId}/debts", debtHandler.ListByCustomer)
 		r.Get("/{customerId}/payments", paymentHandler.ListByCustomer)
 	})
@@ -115,8 +118,8 @@ func main() {
 		r.Get("/", debtHandler.List)
 		r.Post("/", debtHandler.Create)
 		r.Get("/{debtId}", debtHandler.Get)
-		r.Patch("/{debtId}", debtHandler.Update)
-		r.Delete("/{debtId}", debtHandler.Delete)
+		r.With(ownerAdmin).Patch("/{debtId}", debtHandler.Update)
+		r.With(ownerAdmin).Delete("/{debtId}", debtHandler.Delete)
 		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
 		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
 	})
@@ -126,7 +129,7 @@ func main() {
 		r.Get("/", paymentHandler.List)
 		r.Post("/", paymentHandler.Create)
 		r.Get("/{paymentId}", paymentHandler.Get)
-		r.Delete("/{paymentId}", paymentHandler.Delete)
+		r.With(ownerOnly).Delete("/{paymentId}", paymentHandler.Delete)
 	})
 
 	addr := ":" + port
