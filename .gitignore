@@ -21,8 +21,12 @@ coverage.html
 .idea/
 *.swp
 *.swo
-.cursor/
-.claude/
+
+# Working docs, specs and plans — local only.
+# README.md is the only documentation tracked in this repo.
+docs/
+plans/
+specs/
 
 # OS junk
 .DS_Store
