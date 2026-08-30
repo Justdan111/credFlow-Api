@@ -204,6 +204,35 @@ func (s *Service) RiskTrend(ctx context.Context, businessID string, months int) 
 	if points == nil {
 		points = []RiskTrendPoint{}
 	}
+
+	// The daily job only writes once every 24h, so a business that registered
+	// after the last run has no snapshot for this month and would see a blank
+	// chart until tomorrow. Compute the current month's point live instead, so
+	// a new signup sees its position immediately and history fills in behind it.
+	currentMonth := startOfMonth(time.Now()).Format("2006-01")
+	if len(points) == 0 || points[len(points)-1].Month != currentMonth {
+		buckets, err := s.repo.RiskDistribution(ctx, businessID)
+		if err != nil {
+			return out, fmt.Errorf("live risk distribution: %w", err)
+		}
+		live := RiskTrendPoint{Month: currentMonth, Label: monthLabel(currentMonth)}
+		for _, b := range buckets {
+			switch b.RiskLevel {
+			case "low":
+				live.Low = b.CustomerCount
+			case "medium":
+				live.Medium = b.CustomerCount
+			case "high":
+				live.High = b.CustomerCount
+			}
+		}
+		// Only append when there is actually something to show. An empty
+		// business should still report zero months rather than a row of zeros.
+		if live.Low+live.Medium+live.High > 0 {
+			points = append(points, live)
+		}
+	}
+
 	out.Points = points
 	out.Meta.HistoryStartedAt = first
 	out.Meta.MonthsAvailable = len(points)

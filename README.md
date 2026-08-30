@@ -76,6 +76,9 @@ All configuration comes from the environment; `.env` is loaded at startup if pre
 | `REFRESH_ABSOLUTE_TTL` | no | `2160h` | Hard ceiling on a session (90 days) |
 | `ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated exact origins for CORS |
 | `COOKIE_SECURE` | no | `true` | Send the refresh cookie over HTTPS only |
+
+Currency and the monthly collection target are stored per business, not configured
+here — see [Currency](#currency).
 | `DB_MAX_CONNS` | no | `10` | Connection-pool ceiling |
 | `DB_MIN_CONNS` | no | `2` | Connection-pool floor |
 | `APP_ENV` | no | `development` | Environment label |
@@ -255,6 +258,38 @@ require a bearer token.
 Each debt returns `amount_paid` and `amount_remaining` derived from its payments, so the
 two can never drift out of sync with the ledger.
 
+### Dashboard
+
+Aggregations for the dashboard landing screen. All are read-only and tenant-scoped.
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/dashboard/summary` | any | Outstanding, overdue, customers and collected, each with a month-over-month change |
+| `GET` | `/api/dashboard/recent-debts` | any | Latest debts with customer name and days overdue (`limit`, max 20) |
+| `GET` | `/api/dashboard/recent-payments` | any | Latest payments with customer name (`limit`, max 20) |
+| `GET` | `/api/dashboard/risk-distribution` | any | Current low/medium/high customer split |
+| `GET` | `/api/dashboard/collections-trend` | any | Monthly collections and closing balance (`months`, max 24) |
+
+### Analytics
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/analytics/collection-rate` | any | Monthly collections against the business target |
+| `GET` | `/api/analytics/risk-trend` | any | Risk distribution over time, from daily snapshots |
+| `GET` | `/api/analytics/customer-segments` | any | Customers bucketed by lifetime debt value |
+| `GET` | `/api/analytics/export` | any | CSV of the trend and rate series (`format=csv`) |
+
+**Percentage change is `null` when the previous period was zero.** A change from zero is
+undefined, so the API reports nothing rather than an invented `+100%` that would make
+every new business look like it were booming.
+
+**The risk trend depends on recorded history.** `risk_level` is a mutable field, so past
+months cannot be reconstructed — a daily job records the distribution as it happens. The
+response carries `meta.historyStartedAt` and `meta.monthsAvailable` so a client can tell
+a short series caused by young history from one caused by having no customers. The
+current month is computed live, so a business that registered since the last run sees its
+position immediately.
+
 ### Payments
 
 | Method | Path | Role | Description |
@@ -289,6 +324,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 ```
 
 ---
+
+## Currency
+
+Each business has one currency, set on the business record and defaulting to `NGN`.
+Supported values are `NGN`, `GHS`, `KES`, `ZAR` and `USD`. Every aggregate response
+echoes it, so clients never hard-code a symbol.
+
+One currency per business rather than per debt keeps every total valid without exchange
+rates: summing across currencies would be meaningless, and an SME almost always invoices
+in one. `monthly_collection_target` is optional and nullable — a target is a business
+decision, so the API returns `null` when none is set rather than inventing one.
+
+Money is stored as `NUMERIC(14,2)`, and every total, average and comparison is computed
+in SQL where that arithmetic is exact.
 
 ## Testing
 
