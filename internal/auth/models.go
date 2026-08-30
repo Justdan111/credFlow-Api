@@ -29,6 +29,52 @@ type Business struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+// Profile is the /api/auth/me view. Separate from User so phone can be
+// returned without widening the type every other package scans into.
+type Profile struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	Phone     string    `json:"phone"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// UpdateProfileRequest uses pointers so an omitted key is left unchanged.
+// Email is absent on purpose: changing a login identifier needs its own
+// verification flow, and allowing it here would let a stolen access token lock
+// the real owner out.
+type UpdateProfileRequest struct {
+	Name  *string `json:"name,omitempty"`
+	Phone *string `json:"phone,omitempty"`
+}
+
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
+}
+
+type ForgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
+type ResetPasswordRequest struct {
+	Token       string `json:"token"`
+	NewPassword string `json:"newPassword"`
+}
+
+// SessionView is one active login as the settings screen shows it.
+type SessionView struct {
+	ID           string    `json:"id"`
+	UserAgent    string    `json:"userAgent"`
+	CreatedAt    time.Time `json:"createdAt"`
+	LastActiveAt time.Time `json:"lastActiveAt"`
+	// Current marks the session making this request, so the UI can label it
+	// and warn before revoking it.
+	Current bool `json:"current"`
+}
+
 type RegisterRequest struct {
 	BusinessName string `json:"businessName"`
 	Industry     string `json:"industry"`

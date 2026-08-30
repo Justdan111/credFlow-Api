@@ -7,11 +7,13 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,11 +44,13 @@ var testAllowedOrigins = []string{"http://localhost:5173"}
 func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewTestDB(t)
-	testutil.Truncate(t, pool, "customer_risk_snapshots", "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
+	testutil.Truncate(t, pool, "password_reset_tokens", "customer_risk_snapshots", "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
 
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
-	authSvc := auth.NewService(pool, auth.NewRepository(), jwtSvc, testRefreshTTL, testAbsoluteTTL)
+	testMailer = &recordingMailer{}
+	authSvc := auth.NewService(pool, auth.NewRepository(), jwtSvc, testRefreshTTL, testAbsoluteTTL,
+		testMailer, "http://localhost:5173", time.Hour)
 	// Secure:false — httptest serves plain http, so a Secure cookie would
 	// never be stored by the client.
 	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL)
@@ -74,9 +78,15 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		r.Post("/login", authHandler.Login)
 		r.With(originCheck).Post("/refresh", authHandler.Refresh)
 		r.With(originCheck).Post("/logout", authHandler.Logout)
+		r.Post("/forgot-password", authHandler.ForgotPassword)
+		r.Post("/reset-password", authHandler.ResetPassword)
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
 			r.Get("/me", authHandler.Me)
+			r.Patch("/me", authHandler.UpdateMe)
+			r.With(originCheck).Post("/change-password", authHandler.ChangePassword)
+			r.Get("/sessions", authHandler.ListSessions)
+			r.With(originCheck).Delete("/sessions/{sessionId}", authHandler.RevokeSession)
 		})
 	})
 	ownerAdmin := appmiddleware.RequireRole(auth.RoleOwner, auth.RoleAdmin)
@@ -220,3 +230,39 @@ func registerAndLogin(t *testing.T, baseURL, email string) string {
 	}
 	return data.AccessToken
 }
+
+// recordingMailer captures the reset link instead of sending it, so tests can
+// follow the flow end to end without any external service.
+type recordingMailer struct {
+	mu   sync.Mutex
+	sent []sentMail
+}
+
+type sentMail struct {
+	To, Name, URL string
+}
+
+func (m *recordingMailer) SendPasswordReset(_ context.Context, to, name, url string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, sentMail{To: to, Name: name, URL: url})
+	return nil
+}
+
+func (m *recordingMailer) last() (sentMail, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sent) == 0 {
+		return sentMail{}, false
+	}
+	return m.sent[len(m.sent)-1], true
+}
+
+func (m *recordingMailer) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sent)
+}
+
+// testMailer is set by newTestServer so the reset tests can read what was sent.
+var testMailer *recordingMailer

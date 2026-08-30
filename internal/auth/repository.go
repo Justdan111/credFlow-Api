@@ -13,6 +13,7 @@ var (
 	ErrUserNotFound         = errors.New("user not found")
 	ErrEmailTaken           = errors.New("email already registered")
 	ErrRefreshTokenNotFound = errors.New("refresh token not found")
+	ErrResetTokenInvalid    = errors.New("reset token is invalid or has expired")
 )
 
 // DBTX is satisfied by both *pgxpool.Pool and pgx.Tx, so the same repository
@@ -20,6 +21,9 @@ var (
 type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	// Query is needed for multi-row reads such as the session list. Both
+	// *pgxpool.Pool and pgx.Tx provide it, so adding it costs callers nothing.
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 type Repository struct{}
@@ -185,6 +189,197 @@ func (r *Repository) RevokeFamily(ctx context.Context, db DBTX, familyID string)
 // recognise a replayed token rather than silently treating it as unknown.
 func (r *Repository) DeleteExpiredRefreshTokens(ctx context.Context, db DBTX, grace time.Duration) (int64, error) {
 	const q = `DELETE FROM refresh_tokens WHERE expires_at < NOW() - $1::interval`
+	tag, err := db.Exec(ctx, q, grace.String())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// --- profile ---
+
+// UpdateProfile changes only the fields the caller supplied. Email is not
+// updatable here: changing a login identifier needs its own verification flow.
+func (r *Repository) UpdateProfile(ctx context.Context, db DBTX, userID string, name, phone *string) (User, error) {
+	const q = `
+		UPDATE users
+		SET name  = COALESCE($2, name),
+		    phone = CASE WHEN $3::boolean THEN NULLIF($4, '') ELSE phone END
+		WHERE id = $1
+		RETURNING id, business_id, email, name, role, password_hash, created_at, updated_at
+	`
+	// $3 says "phone was present in the request", so an explicit empty string
+	// clears it while an omitted key leaves it alone.
+	phonePresent := phone != nil
+	phoneVal := ""
+	if phone != nil {
+		phoneVal = *phone
+	}
+	var u User
+	err := db.QueryRow(ctx, q, userID, name, phonePresent, phoneVal).
+		Scan(&u.ID, &u.BusinessID, &u.Email, &u.Name, &u.Role, &u.PasswordHash, &u.CreatedAt, &u.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, ErrUserNotFound
+	}
+	return u, err
+}
+
+func (r *Repository) GetProfile(ctx context.Context, db DBTX, userID string) (User, string, error) {
+	const q = `
+		SELECT id, business_id, email, name, role, password_hash, created_at, updated_at,
+		       COALESCE(phone, '')
+		FROM users WHERE id = $1
+	`
+	var u User
+	var phone string
+	err := db.QueryRow(ctx, q, userID).
+		Scan(&u.ID, &u.BusinessID, &u.Email, &u.Name, &u.Role, &u.PasswordHash,
+			&u.CreatedAt, &u.UpdatedAt, &phone)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, "", ErrUserNotFound
+	}
+	return u, phone, err
+}
+
+func (r *Repository) UpdatePasswordHash(ctx context.Context, db DBTX, userID, hash string) error {
+	const q = `UPDATE users SET password_hash = $2 WHERE id = $1`
+	tag, err := db.Exec(ctx, q, userID, hash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// --- sessions ---
+
+// Session is one login, identified by its refresh-token family.
+type Session struct {
+	ID           string
+	UserAgent    string
+	CreatedAt    time.Time
+	LastActiveAt time.Time
+}
+
+// ListSessions returns one row per live family. Each rotation inserts a
+// successor, so MAX(created_at) within a family is when it last refreshed.
+// Revoked and fully expired families are excluded — a dead session is not one.
+func (r *Repository) ListSessions(ctx context.Context, db DBTX, userID string) ([]Session, error) {
+	const q = `
+		SELECT family_id,
+		       COALESCE((array_agg(user_agent ORDER BY created_at DESC)
+		                 FILTER (WHERE user_agent IS NOT NULL))[1], ''),
+		       MIN(created_at), MAX(created_at)
+		FROM refresh_tokens
+		WHERE user_id = $1
+		  AND revoked_at IS NULL
+		  AND absolute_expires_at > NOW()
+		GROUP BY family_id
+		HAVING MAX(expires_at) > NOW()
+		ORDER BY MAX(created_at) DESC
+	`
+	rows, err := db.Query(ctx, q, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Session, 0, 4)
+	for rows.Next() {
+		var s Session
+		if err := rows.Scan(&s.ID, &s.UserAgent, &s.CreatedAt, &s.LastActiveAt); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// RevokeFamilyForUser scopes the revocation to the calling user, so one user
+// cannot end another's session — including inside the same business.
+func (r *Repository) RevokeFamilyForUser(ctx context.Context, db DBTX, userID, familyID string) (int64, error) {
+	const q = `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND family_id = $2 AND revoked_at IS NULL
+	`
+	tag, err := db.Exec(ctx, q, userID, familyID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// RevokeAllUserSessions ends every session. Used after a password reset: the
+// person who forced it must not keep a live session.
+func (r *Repository) RevokeAllUserSessions(ctx context.Context, db DBTX, userID string) error {
+	const q = `UPDATE refresh_tokens SET revoked_at = NOW()
+	           WHERE user_id = $1 AND revoked_at IS NULL`
+	_, err := db.Exec(ctx, q, userID)
+	return err
+}
+
+// RevokeOtherUserSessions keeps one family alive. Used after a password change,
+// so the user stays signed in where they are while anyone else is evicted.
+func (r *Repository) RevokeOtherUserSessions(ctx context.Context, db DBTX, userID, keepFamilyID string) error {
+	const q = `UPDATE refresh_tokens SET revoked_at = NOW()
+	           WHERE user_id = $1 AND revoked_at IS NULL AND family_id <> $2`
+	_, err := db.Exec(ctx, q, userID, keepFamilyID)
+	return err
+}
+
+// FamilyForToken resolves a refresh token to its family, so the session list
+// can mark which entry is the caller's own.
+func (r *Repository) FamilyForToken(ctx context.Context, db DBTX, hash []byte) (string, error) {
+	const q = `SELECT family_id FROM refresh_tokens WHERE token_hash = $1`
+	var id string
+	err := db.QueryRow(ctx, q, hash).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrRefreshTokenNotFound
+	}
+	return id, err
+}
+
+// --- password reset ---
+
+// InvalidateResetTokens burns a user's outstanding tokens so only the newest
+// link works. Requesting a second reset must not leave the first one live.
+func (r *Repository) InvalidateResetTokens(ctx context.Context, db DBTX, userID string) error {
+	const q = `UPDATE password_reset_tokens SET used_at = NOW()
+	           WHERE user_id = $1 AND used_at IS NULL`
+	_, err := db.Exec(ctx, q, userID)
+	return err
+}
+
+func (r *Repository) CreateResetToken(ctx context.Context, db DBTX, userID string, hash []byte, expiresAt time.Time) error {
+	const q = `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+	           VALUES ($1, $2, $3)`
+	_, err := db.Exec(ctx, q, userID, hash, expiresAt)
+	return err
+}
+
+// ClaimResetToken atomically marks a token used and returns its user.
+//
+// The whole validity check lives in the WHERE clause, so Postgres holds a row
+// lock and only one caller can redeem a token. Reading first and updating after
+// would let two concurrent requests both reset the password.
+func (r *Repository) ClaimResetToken(ctx context.Context, db DBTX, hash []byte) (string, error) {
+	const q = `
+		UPDATE password_reset_tokens SET used_at = NOW()
+		WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+		RETURNING user_id
+	`
+	var userID string
+	err := db.QueryRow(ctx, q, hash).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrResetTokenInvalid
+	}
+	return userID, err
+}
+
+func (r *Repository) DeleteExpiredResetTokens(ctx context.Context, db DBTX, grace time.Duration) (int64, error) {
+	const q = `DELETE FROM password_reset_tokens WHERE expires_at < NOW() - $1::interval`
 	tag, err := db.Exec(ctx, q, grace.String())
 	if err != nil {
 		return 0, err

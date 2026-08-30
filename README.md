@@ -76,6 +76,8 @@ All configuration comes from the environment; `.env` is loaded at startup if pre
 | `REFRESH_ABSOLUTE_TTL` | no | `2160h` | Hard ceiling on a session (90 days) |
 | `ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated exact origins for CORS |
 | `COOKIE_SECURE` | no | `true` | Send the refresh cookie over HTTPS only |
+| `APP_BASE_URL` | no | `http://localhost:5173` | Frontend origin used to build reset links |
+| `PASSWORD_RESET_TTL` | no | `1h` | How long a reset link stays valid |
 
 Currency and the monthly collection target are stored per business, not configured
 here — see [Currency](#currency).
@@ -190,6 +192,34 @@ Only the digest of a token is ever stored. It is hashed with SHA-256 rather than
 a 256-bit random token has no dictionary to attack, so bcrypt's deliberate slowness would
 buy nothing, and its random salt would make the digest impossible to index or look up.
 
+### Account recovery
+
+`POST /api/auth/forgot-password` **always** returns `202` with the same body, whether or
+not the address is registered. Any difference in status, body or timing would turn it
+into an account-enumeration oracle.
+
+The link carries a 256-bit token; only its SHA-256 digest is stored, so a leaked database
+contains nothing redeemable. Tokens are **single-use** and expire after
+`PASSWORD_RESET_TTL` (default one hour) — a link left in an inbox must not stay valid.
+Requesting a second link invalidates the first.
+
+Redeeming a token **revokes every session** for that user: whoever forced the reset must
+not keep a live one. `POST /api/auth/change-password` revokes every *other* session and
+leaves the caller signed in, and requires the current password even though the caller is
+already authenticated — a stolen access token must not be enough to take an account over.
+
+`PATCH /api/auth/me` deliberately cannot change the email address: a login identifier
+needs its own verification flow.
+
+### Email delivery
+
+Password recovery sends mail through a small `Mailer` interface. The default
+implementation logs the link to the application log, so the whole flow works in
+development with no external service. A real provider is one type satisfying the same
+interface, wired in `cmd/server/main.go`.
+
+`APP_BASE_URL` (default `http://localhost:5173`) builds the link the frontend consumes.
+
 ### CORS
 
 Browser clients must be listed in `ALLOWED_ORIGINS`. The API echoes the exact matching
@@ -229,7 +259,13 @@ require a bearer token.
 | `POST` | `/api/auth/login` | — | Exchange credentials for a session |
 | `POST` | `/api/auth/refresh` | cookie | Rotate the refresh token, get a new access token |
 | `POST` | `/api/auth/logout` | cookie | Revoke the current session |
+| `POST` | `/api/auth/forgot-password` | — | Request a reset link (always `202`) |
+| `POST` | `/api/auth/reset-password` | — | Redeem a reset token |
 | `GET` | `/api/auth/me` | any | Current user and business |
+| `PATCH` | `/api/auth/me` | any | Update name and phone |
+| `POST` | `/api/auth/change-password` | any | Change password; evicts other sessions |
+| `GET` | `/api/auth/sessions` | any | Active logins, with the current one flagged |
+| `DELETE` | `/api/auth/sessions/{sessionId}` | any | Revoke one session |
 
 ### Business & onboarding
 
