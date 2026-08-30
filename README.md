@@ -78,6 +78,9 @@ All configuration comes from the environment; `.env` is loaded at startup if pre
 | `COOKIE_SECURE` | no | `true` | Send the refresh cookie over HTTPS only |
 | `APP_BASE_URL` | no | `http://localhost:5173` | Frontend origin used to build reset links |
 | `PASSWORD_RESET_TTL` | no | `1h` | How long a reset link stays valid |
+| `TRUST_PROXY_HEADERS` | no | `false` | Honour `X-Forwarded-For` — only behind a proxy that overwrites it |
+| `MAX_REQUEST_BODY_BYTES` | no | `1048576` | Request body cap (1 MiB) |
+| `ENABLE_HSTS` | no | `true` | Send HSTS on TLS requests |
 
 Currency and the monthly collection target are stored per business, not configured
 here — see [Currency](#currency).
@@ -407,6 +410,50 @@ afterwards. `GET /api/businesses/current` reports `currencyLocked`, so a client 
 disable the selector rather than offer a change the API will reject.
 
 `monthlyCollectionTarget` has no such constraint and stays editable at any time.
+
+## Rate limiting
+
+The unauthenticated endpoints are throttled. Exceeding a limit returns `429` with
+`Retry-After` in seconds.
+
+| Endpoint | Limit | Keyed on |
+|---|---|---|
+| `POST /api/auth/login` | 5 / minute | IP **+** email |
+| `POST /api/auth/register` | 10 / hour | IP |
+| `POST /api/auth/forgot-password` | 3 / hour | email |
+| `POST /api/auth/forgot-password` | 20 / hour | IP |
+| `POST /api/auth/reset-password` | 10 / hour | IP |
+| `POST /api/auth/refresh` | 30 / minute | IP |
+
+**Login is keyed on IP *and* email together.** Carrier-grade NAT is widespread on African
+mobile networks, so many unrelated subscribers share one public address — an IP-only
+limit would let one person's failed logins lock out everybody behind the same operator.
+`forgot-password` is keyed per address for the same reason, with a loose per-IP ceiling
+behind it to stop bulk abuse. Nothing hard-locks: every window rolls, so a targeted user
+can always recover within the hour.
+
+Counters are held **in process**. With multiple replicas the effective limit is roughly
+multiplied by the replica count, and a restart clears them. The `Limiter` interface exists
+so a shared Redis backend can replace the in-memory one without touching callers.
+
+### `TRUST_PROXY_HEADERS`
+
+Defaults to **false**, and should stay false unless a load balancer that overwrites
+`X-Forwarded-For` sits in front. When false the true TCP peer address is used and
+client-supplied headers are ignored entirely — otherwise a caller could forge a different
+address on every request and bypass every IP-based limit.
+
+## Security headers
+
+Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: strict-origin-when-cross-origin` and
+`Cross-Origin-Opener-Policy: same-origin`.
+
+`Strict-Transport-Security` is sent **only over TLS**, so local http development is not
+pinned to https in the browser. There is no Content-Security-Policy: this API returns
+JSON and never HTML.
+
+Request bodies are capped at `MAX_REQUEST_BODY_BYTES`; anything larger gets `413`.
 
 ## Testing
 

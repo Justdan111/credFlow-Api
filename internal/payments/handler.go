@@ -1,7 +1,6 @@
 package payments
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -29,8 +28,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	p, replay, err := h.svc.Create(r.Context(), businessID, req)
@@ -69,8 +67,7 @@ func (h *Handler) CreateForDebt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	// Trust the URL. Any customerId/debtId in the body is ignored.

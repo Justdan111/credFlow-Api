@@ -1,7 +1,6 @@
 package debts
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -27,8 +26,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	d, err := h.svc.Create(r.Context(), businessID, req)
@@ -60,8 +58,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req UpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	d, err := h.svc.Update(r.Context(), businessID, chi.URLParam(r, "debtId"), req)

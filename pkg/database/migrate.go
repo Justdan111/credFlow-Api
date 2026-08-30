@@ -11,7 +11,6 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
-
 func RunMigrations(migrationsPath, dbURL string) error {
 	pgxURL, err := toPgx5URL(dbURL)
 	if err != nil {
