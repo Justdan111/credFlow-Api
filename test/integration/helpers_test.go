@@ -21,6 +21,7 @@ import (
 
 	"github.com/Justdan111/credflow-api/internal/analytics"
 	"github.com/Justdan111/credflow-api/internal/auth"
+	"github.com/Justdan111/credflow-api/internal/businesses"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
@@ -49,6 +50,11 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	// Secure:false — httptest serves plain http, so a Secure cookie would
 	// never be stored by the client.
 	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL)
+
+	customerSvc := customers.NewService(customers.NewRepository(pool))
+	debtSvcForBiz := debts.NewService(debts.NewRepository(pool))
+	businessHandler := businesses.NewHandler(businesses.NewService(pool,
+		businesses.NewRepository(pool), customerSvc, debtSvcForBiz))
 
 	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
 	analyticsHandler := analytics.NewHandler(analyticsSvc)
@@ -96,6 +102,17 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
 		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
 	})
+	r.Route("/api/businesses", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/current", businessHandler.Get)
+		r.With(ownerAdmin).Patch("/current", businessHandler.Update)
+	})
+	r.Route("/api/onboarding", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/status", businessHandler.OnboardingStatus)
+		r.Post("/complete", businessHandler.OnboardingComplete)
+	})
+
 	r.Route("/api/dashboard", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
 		r.Get("/summary", analyticsHandler.Summary)

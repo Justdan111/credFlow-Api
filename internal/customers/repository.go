@@ -12,9 +12,9 @@ import (
 )
 
 var (
-	ErrNotFound    = errors.New("customer not found")
-	ErrEmailTaken  = errors.New("a customer with this email already exists")
-	ErrNoFields    = errors.New("no fields to update")
+	ErrNotFound   = errors.New("customer not found")
+	ErrEmailTaken = errors.New("a customer with this email already exists")
+	ErrNoFields   = errors.New("no fields to update")
 )
 
 type Repository struct {
@@ -39,7 +39,20 @@ func scanCustomer(row pgx.Row) (Customer, error) {
 	return c, err
 }
 
+// DBTX lets a caller run Create inside an existing transaction. *pgxpool.Pool
+// and pgx.Tx both satisfy it, so the same SQL serves both paths.
+type DBTX interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Create inserts a customer using the pool.
 func (r *Repository) Create(ctx context.Context, businessID string, req CreateRequest) (Customer, error) {
+	return r.CreateTx(ctx, r.db, businessID, req)
+}
+
+// CreateTx is Create against a caller-supplied transaction, so onboarding can
+// create a business, customer and debt atomically without duplicating this SQL.
+func (r *Repository) CreateTx(ctx context.Context, db DBTX, businessID string, req CreateRequest) (Customer, error) {
 	q := `
 		INSERT INTO customers
 			(business_id, name, email, phone, company_name, address, risk_level, credit_limit, notes)
@@ -47,7 +60,7 @@ func (r *Repository) Create(ctx context.Context, businessID string, req CreateRe
 			($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $8, NULLIF($9, ''))
 		RETURNING ` + customerColumns
 
-	row := r.db.QueryRow(ctx, q,
+	row := db.QueryRow(ctx, q,
 		businessID, req.Name, req.Email, req.Phone, req.CompanyName,
 		req.Address, req.RiskLevel, req.CreditLimit, req.Notes,
 	)

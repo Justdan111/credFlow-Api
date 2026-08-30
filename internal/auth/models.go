@@ -14,10 +14,17 @@ type User struct {
 }
 
 type Business struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Industry  *string   `json:"industry,omitempty"`
-	Size      *string   `json:"size,omitempty"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Industry *string `json:"industry,omitempty"`
+	Size     *string `json:"size,omitempty"`
+	// Currency and OnboardingCompleted let the frontend render amounts and
+	// decide between the dashboard and the onboarding flow straight from the
+	// login response, instead of a second round-trip that would briefly show
+	// the wrong screen. Additive fields — no existing key changes.
+	Currency            string `json:"currency"`
+	OnboardingCompleted bool   `json:"onboardingCompleted"`
+
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }

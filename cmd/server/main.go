@@ -19,6 +19,7 @@ import (
 
 	"github.com/Justdan111/credflow-api/internal/analytics"
 	"github.com/Justdan111/credflow-api/internal/auth"
+	"github.com/Justdan111/credflow-api/internal/businesses"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
@@ -80,6 +81,10 @@ func main() {
 	debtRepo := debts.NewRepository(pool)
 	debtSvc := debts.NewService(debtRepo)
 	debtHandler := debts.NewHandler(debtSvc)
+
+	businessSvc := businesses.NewService(pool, businesses.NewRepository(pool),
+		customerSvc, debtSvc)
+	businessHandler := businesses.NewHandler(businessSvc)
 
 	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
 	analyticsHandler := analytics.NewHandler(analyticsSvc)
@@ -149,6 +154,20 @@ func main() {
 
 	// Dashboard and analytics read the same tables and share one package; the
 	// split is only a URL grouping the frontend expects.
+	r.Route("/api/businesses", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/current", businessHandler.Get)
+		// Editing the profile is administrative: currency and the collection
+		// target shape every financial figure the business reports.
+		r.With(ownerAdmin).Patch("/current", businessHandler.Update)
+	})
+
+	r.Route("/api/onboarding", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/status", businessHandler.OnboardingStatus)
+		r.Post("/complete", businessHandler.OnboardingComplete)
+	})
+
 	r.Route("/api/dashboard", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
 		r.Get("/summary", analyticsHandler.Summary)

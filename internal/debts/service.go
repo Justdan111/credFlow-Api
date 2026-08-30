@@ -68,6 +68,41 @@ func (s *Service) Create(ctx context.Context, businessID string, req CreateReque
 	return s.repo.Create(ctx, businessID, req.CustomerID, req.Amount, req.Description, issued, due)
 }
 
+// CreateTx is Create against a caller-supplied transaction, so another package
+// can create a debt atomically alongside its own writes. It runs the same
+// validation and date defaulting as Create.
+func (s *Service) CreateTx(ctx context.Context, db DBTX, businessID string, req CreateRequest) (Debt, error) {
+	if strings.TrimSpace(req.CustomerID) == "" {
+		return Debt{}, fmt.Errorf("%w: customerId is required", ErrValidation)
+	}
+	if req.Amount <= 0 {
+		return Debt{}, fmt.Errorf("%w: amount must be greater than 0", ErrValidation)
+	}
+
+	// issuedDate defaults to today when omitted.
+	issued := time.Now()
+	if req.IssuedDate != "" {
+		d, err := time.Parse(dateLayout, req.IssuedDate)
+		if err != nil {
+			return Debt{}, fmt.Errorf("%w: issuedDate must be YYYY-MM-DD", ErrValidation)
+		}
+		issued = d
+	}
+
+	if req.DueDate == "" {
+		return Debt{}, fmt.Errorf("%w: dueDate is required", ErrValidation)
+	}
+	due, err := time.Parse(dateLayout, req.DueDate)
+	if err != nil {
+		return Debt{}, fmt.Errorf("%w: dueDate must be YYYY-MM-DD", ErrValidation)
+	}
+	if due.Before(issued) {
+		return Debt{}, fmt.Errorf("%w: dueDate cannot be before issuedDate", ErrValidation)
+	}
+
+	return s.repo.CreateTx(ctx, db, businessID, req.CustomerID, req.Amount, req.Description, issued, due)
+}
+
 func (s *Service) Get(ctx context.Context, businessID, id string) (Debt, error) {
 	return s.repo.Get(ctx, businessID, id)
 }

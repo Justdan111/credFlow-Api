@@ -63,7 +63,17 @@ func scanDebt(row pgx.Row) (Debt, error) {
 // Create inserts a debt only if the customer exists, is active, and belongs
 // to this tenant — all in a single statement. The INSERT...SELECT...WHERE
 // EXISTS pattern avoids a check-then-insert race condition.
+// DBTX lets a caller run Create inside an existing transaction.
+type DBTX interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 func (r *Repository) Create(ctx context.Context, businessID, customerID string, amount float64, description string, issued, due time.Time) (Debt, error) {
+	return r.CreateTx(ctx, r.db, businessID, customerID, amount, description, issued, due)
+}
+
+// CreateTx is Create against a caller-supplied transaction.
+func (r *Repository) CreateTx(ctx context.Context, db DBTX, businessID, customerID string, amount float64, description string, issued, due time.Time) (Debt, error) {
 	q := `
 		INSERT INTO debts (business_id, customer_id, amount, description, issued_date, due_date)
 		SELECT $1, $2, $3, NULLIF($4, ''), $5, $6
@@ -73,7 +83,7 @@ func (r *Repository) Create(ctx context.Context, businessID, customerID string, 
 		)
 		RETURNING ` + debtSelect
 
-	d, err := scanDebt(r.db.QueryRow(ctx, q, businessID, customerID, amount, description, issued, due))
+	d, err := scanDebt(db.QueryRow(ctx, q, businessID, customerID, amount, description, issued, due))
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No row inserted => the WHERE EXISTS failed => customer not valid.
 		return Debt{}, ErrCustomerNotFound
