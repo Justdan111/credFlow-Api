@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"github.com/Justdan111/credflow-api/internal/analytics"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
@@ -79,6 +80,9 @@ func main() {
 	debtRepo := debts.NewRepository(pool)
 	debtSvc := debts.NewService(debtRepo)
 	debtHandler := debts.NewHandler(debtSvc)
+
+	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
+	analyticsHandler := analytics.NewHandler(analyticsSvc)
 
 	paymentRepo := payments.NewRepository(pool)
 	paymentSvc := payments.NewService(paymentRepo)
@@ -143,6 +147,25 @@ func main() {
 		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
 	})
 
+	// Dashboard and analytics read the same tables and share one package; the
+	// split is only a URL grouping the frontend expects.
+	r.Route("/api/dashboard", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/summary", analyticsHandler.Summary)
+		r.Get("/recent-debts", analyticsHandler.RecentDebts)
+		r.Get("/recent-payments", analyticsHandler.RecentPayments)
+		r.Get("/risk-distribution", analyticsHandler.RiskDistribution)
+		r.Get("/collections-trend", analyticsHandler.CollectionsTrend)
+	})
+
+	r.Route("/api/analytics", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/collection-rate", analyticsHandler.CollectionRate)
+		r.Get("/risk-trend", analyticsHandler.RiskTrend)
+		r.Get("/customer-segments", analyticsHandler.CustomerSegments)
+		r.Get("/export", analyticsHandler.Export)
+	})
+
 	r.Route("/api/payments", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
 		r.Get("/", paymentHandler.List)
@@ -166,6 +189,7 @@ func main() {
 	appCtx, cancelApp := context.WithCancel(context.Background())
 	defer cancelApp()
 	go runTokenCleanup(appCtx, authSvc)
+	go runRiskSnapshots(appCtx, analyticsSvc)
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -224,6 +248,41 @@ func runTokenCleanup(ctx context.Context, svc *auth.Service) {
 			if n > 0 {
 				log.Printf("refresh token cleanup removed %d expired rows", n)
 			}
+		}
+	}
+}
+
+// runRiskSnapshots records the customer risk distribution once a day.
+//
+// customers.risk_level is mutable with no history, so a past month's mix is
+// unrecoverable unless it is written down as it happens. The snapshot runs once
+// at startup too, so a fresh deployment has a data point immediately rather
+// than an empty chart for 24 hours.
+func runRiskSnapshots(ctx context.Context, svc *analytics.Service) {
+	const interval = 24 * time.Hour
+
+	write := func() {
+		// Bound each run so a slow write cannot outlive the interval.
+		runCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		n, err := svc.WriteRiskSnapshots(runCtx)
+		if err != nil {
+			log.Printf("risk snapshot failed: %v", err)
+			return
+		}
+		log.Printf("risk snapshot recorded for %d businesses", n)
+	}
+
+	write()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			write()
 		}
 	}
 }
