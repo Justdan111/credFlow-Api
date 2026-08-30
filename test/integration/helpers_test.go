@@ -19,6 +19,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Justdan111/credflow-api/internal/analytics"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
@@ -40,7 +41,7 @@ var testAllowedOrigins = []string{"http://localhost:5173"}
 func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewTestDB(t)
-	testutil.Truncate(t, pool, "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
+	testutil.Truncate(t, pool, "customer_risk_snapshots", "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
 
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
@@ -48,6 +49,9 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	// Secure:false — httptest serves plain http, so a Secure cookie would
 	// never be stored by the client.
 	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL)
+
+	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
+	analyticsHandler := analytics.NewHandler(analyticsSvc)
 
 	customerHandler := customers.NewHandler(customers.NewService(customers.NewRepository(pool)))
 	debtRepo := debts.NewRepository(pool)
@@ -92,6 +96,22 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
 		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
 	})
+	r.Route("/api/dashboard", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/summary", analyticsHandler.Summary)
+		r.Get("/recent-debts", analyticsHandler.RecentDebts)
+		r.Get("/recent-payments", analyticsHandler.RecentPayments)
+		r.Get("/risk-distribution", analyticsHandler.RiskDistribution)
+		r.Get("/collections-trend", analyticsHandler.CollectionsTrend)
+	})
+	r.Route("/api/analytics", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/collection-rate", analyticsHandler.CollectionRate)
+		r.Get("/risk-trend", analyticsHandler.RiskTrend)
+		r.Get("/customer-segments", analyticsHandler.CustomerSegments)
+		r.Get("/export", analyticsHandler.Export)
+	})
+
 	r.Route("/api/payments", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
 		r.Get("/", paymentHandler.List)
