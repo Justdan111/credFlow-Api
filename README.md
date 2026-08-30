@@ -231,6 +231,26 @@ require a bearer token.
 | `POST` | `/api/auth/logout` | cookie | Revoke the current session |
 | `GET` | `/api/auth/me` | any | Current user and business |
 
+### Business & onboarding
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/businesses/current` | any | The active business profile |
+| `PATCH` | `/api/businesses/current` | admin | Update name, industry, size, currency, collection target |
+| `GET` | `/api/onboarding/status` | any | Completion state and the step to resume at |
+| `POST` | `/api/onboarding/complete` | any | Persist the whole onboarding flow in one transaction |
+
+`PATCH` is a partial update: an omitted key is left unchanged, while an explicit
+`"monthlyCollectionTarget": null` clears the target.
+
+`POST /api/onboarding/complete` takes the three-step payload — business profile, an
+optional first customer, an optional first debt — and applies all of it atomically. A
+debt without a customer is a `400`, since there would be nobody to owe it. Calling it
+again returns `409` rather than creating a second "first" customer on a double submit.
+
+`GET /api/onboarding/status` derives each step from real records rather than a stored
+counter, so it cannot drift out of sync with what the business actually has.
+
 ### Customers
 
 | Method | Path | Role | Description |
@@ -338,6 +358,19 @@ decision, so the API returns `null` when none is set rather than inventing one.
 
 Money is stored as `NUMERIC(14,2)`, and every total, average and comparison is computed
 in SQL where that arithmetic is exact.
+
+### Currency is locked once money exists
+
+Amounts carry no currency of their own — they inherit the business's. Changing the
+business currency therefore **converts nothing**: a debt recorded as ₦2,500,000 would
+afterwards read as ₵2,500,000.
+
+So the currency is freely settable while the business has no debts and no payments —
+which is exactly when the choice is made, during onboarding — and returns `409`
+afterwards. `GET /api/businesses/current` reports `currencyLocked`, so a client can
+disable the selector rather than offer a change the API will reject.
+
+`monthlyCollectionTarget` has no such constraint and stays editable at any time.
 
 ## Testing
 

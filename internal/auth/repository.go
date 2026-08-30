@@ -30,11 +30,13 @@ func (r *Repository) CreateBusiness(ctx context.Context, db DBTX, name, industry
 	const q = `
 		INSERT INTO businesses (name, industry, size)
 		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
-		RETURNING id, name, industry, size, created_at, updated_at
+		RETURNING id, name, industry, size, currency,
+		          onboarding_completed_at IS NOT NULL, created_at, updated_at
 	`
 	var b Business
 	err := db.QueryRow(ctx, q, name, industry, size).
-		Scan(&b.ID, &b.Name, &b.Industry, &b.Size, &b.CreatedAt, &b.UpdatedAt)
+		Scan(&b.ID, &b.Name, &b.Industry, &b.Size, &b.Currency,
+			&b.OnboardingCompleted, &b.CreatedAt, &b.UpdatedAt)
 	return b, err
 }
 
@@ -91,13 +93,15 @@ func (r *Repository) GetUserByID(ctx context.Context, db DBTX, id string) (User,
 
 func (r *Repository) GetBusinessByID(ctx context.Context, db DBTX, id string) (Business, error) {
 	const q = `
-		SELECT id, name, industry, size, created_at, updated_at
+		SELECT id, name, industry, size, currency,
+		       onboarding_completed_at IS NOT NULL, created_at, updated_at
 		FROM businesses
 		WHERE id = $1
 	`
 	var b Business
 	err := db.QueryRow(ctx, q, id).
-		Scan(&b.ID, &b.Name, &b.Industry, &b.Size, &b.CreatedAt, &b.UpdatedAt)
+		Scan(&b.ID, &b.Name, &b.Industry, &b.Size, &b.Currency,
+			&b.OnboardingCompleted, &b.CreatedAt, &b.UpdatedAt)
 	return b, err
 }
 

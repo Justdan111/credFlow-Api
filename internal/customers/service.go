@@ -44,6 +44,17 @@ func (s *Service) Create(ctx context.Context, businessID string, req CreateReque
 	return s.repo.Create(ctx, businessID, req)
 }
 
+// CreateTx is Create against a caller-supplied transaction, so another package
+// can create a customer atomically alongside its own writes. It runs the same
+// validation and defaulting — notably risk_level, which the database CHECK
+// rejects when empty — so callers must not reach for the repository directly.
+func (s *Service) CreateTx(ctx context.Context, db DBTX, businessID string, req CreateRequest) (Customer, error) {
+	if err := validateCreate(&req); err != nil {
+		return Customer{}, err
+	}
+	return s.repo.CreateTx(ctx, db, businessID, req)
+}
+
 func (s *Service) Get(ctx context.Context, businessID, id string) (Customer, error) {
 	return s.repo.Get(ctx, businessID, id)
 }
