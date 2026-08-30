@@ -49,8 +49,8 @@ func (s *Service) Create(ctx context.Context, businessID string, req CreateReque
 	}
 
 	var (
-		out     Payment
-		replay  bool
+		out    Payment
+		replay bool
 	)
 	txErr := pgx.BeginFunc(ctx, s.repo.Pool(), func(tx pgx.Tx) error {
 		var err error

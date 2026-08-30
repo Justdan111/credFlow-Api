@@ -26,6 +26,7 @@ import (
 	"github.com/Justdan111/credflow-api/internal/payments"
 	"github.com/Justdan111/credflow-api/pkg/database"
 	"github.com/Justdan111/credflow-api/pkg/mailer"
+	"github.com/Justdan111/credflow-api/pkg/ratelimit"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
@@ -53,6 +54,12 @@ func main() {
 	// Short by design: a reset link is a bearer credential for taking over an
 	// account, so it should not sit valid in an inbox for long.
 	resetTTL := envDuration("PASSWORD_RESET_TTL", time.Hour)
+	// Defaults to FALSE deliberately. Trusting X-Forwarded-For without a proxy
+	// that overwrites it lets any client forge its own address and bypass every
+	// IP-based rate limit. Enable only when a load balancer sits in front.
+	trustProxyHeaders := envBool("TRUST_PROXY_HEADERS", false)
+	maxBodyBytes := int64(envInt32("MAX_REQUEST_BODY_BYTES", 1<<20)) // 1 MiB
+	enableHSTS := envBool("ENABLE_HSTS", true)
 	maxConns := envInt32("DB_MAX_CONNS", 10)
 	minConns := envInt32("DB_MIN_CONNS", 2)
 	port := envString("PORT", "8080")
@@ -104,12 +111,22 @@ func main() {
 
 	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
+	limiter := ratelimit.NewMemory()
+
 	r := chi.NewRouter()
 	// CORS must run before anything that can short-circuit, so even error
 	// responses carry the headers a browser needs to read them.
 	r.Use(appmiddleware.CORS(allowedOrigins))
+	r.Use(appmiddleware.SecurityHeaders(enableHSTS))
+	r.Use(appmiddleware.BodyLimit(maxBodyBytes))
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	// RealIP rewrites RemoteAddr from client-supplied headers with no
+	// validation, so it is mounted ONLY when something upstream is known to
+	// overwrite them. Otherwise RemoteAddr stays the true TCP peer and the rate
+	// limiter cannot be fooled by a forged X-Forwarded-For.
+	if trustProxyHeaders {
+		r.Use(chimiddleware.RealIP)
+	}
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(60 * time.Second))
@@ -121,18 +138,54 @@ func main() {
 	// endpoints. Reads are not guarded: they carry no cookie-backed authority.
 	originCheck := appmiddleware.RequireAllowedOrigin(allowedOrigins)
 
+	// Rate limits. Tight buckets on the composite or account key, loose
+	// ceilings on IP: carrier-grade NAT is widespread on African mobile
+	// networks, so many unrelated users share one address and an IP-only limit
+	// would lock out an entire operator pool.
+	limitLogin := appmiddleware.RateLimit(limiter, appmiddleware.RateLimitRule{
+		Name: "login", Limit: 5, Window: time.Minute,
+		// IP+email: two subscribers behind one NAT get separate buckets.
+		KeyFunc: appmiddleware.ByIPAndEmail,
+	})
+	// Register is the one endpoint with no pre-existing account to key on, so
+	// it can only use IP — the very key the login limit avoids relying on. On
+	// carrier-grade NAT a whole office or ISP pool shares one address, so a
+	// tight limit here would block legitimate signups exactly where this phase
+	// is trying to be careful. 10/hour still stops bulk automation cold while
+	// leaving room for a real shared connection.
+	limitRegister := appmiddleware.RateLimit(limiter, appmiddleware.RateLimitRule{
+		Name: "register", Limit: 10, Window: time.Hour, KeyFunc: appmiddleware.ByIP,
+	})
+	limitForgot := appmiddleware.RateLimit(limiter,
+		// Per-address, so one person cannot be mail-bombed...
+		appmiddleware.RateLimitRule{
+			Name: "forgot-email", Limit: 3, Window: time.Hour,
+			KeyFunc: appmiddleware.ByEmailField,
+		},
+		// ...plus a loose per-IP ceiling against bulk abuse across addresses.
+		appmiddleware.RateLimitRule{
+			Name: "forgot-ip", Limit: 20, Window: time.Hour, KeyFunc: appmiddleware.ByIP,
+		},
+	)
+	limitReset := appmiddleware.RateLimit(limiter, appmiddleware.RateLimitRule{
+		Name: "reset", Limit: 10, Window: time.Hour, KeyFunc: appmiddleware.ByIP,
+	})
+	limitRefresh := appmiddleware.RateLimit(limiter, appmiddleware.RateLimitRule{
+		Name: "refresh", Limit: 30, Window: time.Minute, KeyFunc: appmiddleware.ByIP,
+	})
+
 	r.Route("/api/auth", func(r chi.Router) {
-		r.Post("/register", authHandler.Register)
-		r.Post("/login", authHandler.Login)
+		r.With(limitRegister).Post("/register", authHandler.Register)
+		r.With(limitLogin).Post("/login", authHandler.Login)
 
 		// Deliberately outside RequireAuth: refresh must work precisely when
 		// the access token has expired. The httpOnly cookie is the credential.
-		r.With(originCheck).Post("/refresh", authHandler.Refresh)
+		r.With(originCheck, limitRefresh).Post("/refresh", authHandler.Refresh)
 		r.With(originCheck).Post("/logout", authHandler.Logout)
 
 		// Unauthenticated by necessity: a locked-out user has no token.
-		r.Post("/forgot-password", authHandler.ForgotPassword)
-		r.Post("/reset-password", authHandler.ResetPassword)
+		r.With(limitForgot).Post("/forgot-password", authHandler.ForgotPassword)
+		r.With(limitReset).Post("/reset-password", authHandler.ResetPassword)
 
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
@@ -226,6 +279,7 @@ func main() {
 	defer cancelApp()
 	go runTokenCleanup(appCtx, authSvc)
 	go runRiskSnapshots(appCtx, analyticsSvc)
+	go runLimiterSweep(appCtx, limiter)
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -324,6 +378,31 @@ func runRiskSnapshots(ctx context.Context, svc *analytics.Service) {
 			return
 		case <-ticker.C:
 			write()
+		}
+	}
+}
+
+// runLimiterSweep evicts idle rate-limit buckets so memory does not grow with
+// every address that has ever connected.
+func runLimiterSweep(ctx context.Context, limiter *ratelimit.Memory) {
+	const (
+		interval = 5 * time.Minute
+		// Comfortably longer than the widest window (1 hour), so a bucket is
+		// never dropped while it still constrains anybody.
+		idleFor = 2 * time.Hour
+	)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n := limiter.Sweep(idleFor); n > 0 {
+				log.Printf("rate limiter swept %d idle buckets", n)
+			}
 		}
 	}
 }

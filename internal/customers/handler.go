@@ -1,7 +1,6 @@
 package customers
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -28,8 +27,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
@@ -66,8 +64,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "customerId")
 
 	var req UpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 

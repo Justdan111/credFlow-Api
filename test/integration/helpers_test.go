@@ -29,6 +29,7 @@ import (
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
 	"github.com/Justdan111/credflow-api/internal/payments"
 	"github.com/Justdan111/credflow-api/internal/testutil"
+	"github.com/Justdan111/credflow-api/pkg/ratelimit"
 )
 
 const (
@@ -49,6 +50,7 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
 	testMailer = &recordingMailer{}
+	limiter := ratelimit.NewMemory()
 	authSvc := auth.NewService(pool, auth.NewRepository(), jwtSvc, testRefreshTTL, testAbsoluteTTL,
 		testMailer, "http://localhost:5173", time.Hour)
 	// Secure:false — httptest serves plain http, so a Secure cookie would
@@ -69,16 +71,21 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	paymentHandler := payments.NewHandler(payments.NewService(payments.NewRepository(pool)), debtRepo)
 
 	r := chi.NewRouter()
+	r.Use(appmiddleware.SecurityHeaders(true))
+	r.Use(appmiddleware.BodyLimit(testMaxBodyBytes))
 	r.Use(chimiddleware.Recoverer)
+	// chimiddleware.RealIP is deliberately NOT mounted, mirroring the default
+	// TRUST_PROXY_HEADERS=false: RemoteAddr stays the true peer so a forged
+	// X-Forwarded-For cannot reset a rate limit.
 
 	originCheck := appmiddleware.RequireAllowedOrigin(testAllowedOrigins)
 
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.Register)
-		r.Post("/login", authHandler.Login)
+		r.With(testLimitLogin(limiter)).Post("/login", authHandler.Login)
 		r.With(originCheck).Post("/refresh", authHandler.Refresh)
 		r.With(originCheck).Post("/logout", authHandler.Logout)
-		r.Post("/forgot-password", authHandler.ForgotPassword)
+		r.With(testLimitForgot(limiter)).Post("/forgot-password", authHandler.ForgotPassword)
 		r.Post("/reset-password", authHandler.ResetPassword)
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
@@ -266,3 +273,27 @@ func (m *recordingMailer) count() int {
 
 // testMailer is set by newTestServer so the reset tests can read what was sent.
 var testMailer *recordingMailer
+
+// Test limits are smaller than production so a security test can reach them
+// quickly, but must stay high enough not to trip unrelated tests: several
+// legitimately log in three or four times for the same account. The production
+// values live in cmd/server/main.go.
+const (
+	testMaxBodyBytes = 4096
+	testLoginLimit   = 20
+	testForgotLimit  = 2
+)
+
+func testLimitLogin(l ratelimit.Limiter) func(http.Handler) http.Handler {
+	return appmiddleware.RateLimit(l, appmiddleware.RateLimitRule{
+		Name: "login", Limit: testLoginLimit, Window: time.Minute,
+		KeyFunc: appmiddleware.ByIPAndEmail,
+	})
+}
+
+func testLimitForgot(l ratelimit.Limiter) func(http.Handler) http.Handler {
+	return appmiddleware.RateLimit(l, appmiddleware.RateLimitRule{
+		Name: "forgot-email", Limit: testForgotLimit, Window: time.Hour,
+		KeyFunc: appmiddleware.ByEmailField,
+	})
+}

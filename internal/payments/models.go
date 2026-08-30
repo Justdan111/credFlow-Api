@@ -19,9 +19,9 @@ type Payment struct {
 
 type CreateRequest struct {
 	CustomerID     string  `json:"customerId"`
-	DebtID         string  `json:"debtId"`         // empty = unattributed
+	DebtID         string  `json:"debtId"` // empty = unattributed
 	Amount         float64 `json:"amount"`
-	Method         string  `json:"method"`         // empty -> "cash"
+	Method         string  `json:"method"` // empty -> "cash"
 	Reference      string  `json:"reference"`
 	Notes          string  `json:"notes"`
 	PaidAt         string  `json:"paidAt"`         // RFC3339; empty -> now()

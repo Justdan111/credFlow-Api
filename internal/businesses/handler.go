@@ -41,8 +41,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	// Decode into a raw map first so an explicit null can be told apart from an
 	// omitted key — the target field needs that distinction to be clearable.
 	var raw map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &raw) {
 		return
 	}
 
@@ -94,8 +93,7 @@ func (h *Handler) OnboardingComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CompleteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 

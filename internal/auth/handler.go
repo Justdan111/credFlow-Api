@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -23,8 +22,7 @@ func NewHandler(svc *Service, cookie CookieConfig, refreshTTL time.Duration) *Ha
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	out, refresh, err := h.svc.Register(r.Context(), req, r.UserAgent())
@@ -39,8 +37,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	out, refresh, err := h.svc.Login(r.Context(), req, r.UserAgent())
@@ -114,8 +111,7 @@ func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req UpdateProfileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	out, err := h.svc.UpdateProfile(r.Context(), userID, req)
@@ -133,8 +129,7 @@ func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ChangePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
@@ -189,8 +184,7 @@ func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 // difference in status or body would make this an account-enumeration oracle.
 func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	var req ForgotPasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	if err := h.svc.ForgotPassword(r.Context(), req); err != nil {
@@ -207,8 +201,7 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	var req ResetPasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Fail(w, http.StatusBadRequest, "invalid json body")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 	if err := h.svc.ResetPassword(r.Context(), req); err != nil {
