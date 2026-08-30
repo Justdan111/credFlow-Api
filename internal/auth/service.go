@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/mail"
 	"strings"
 	"time"
@@ -24,6 +25,13 @@ var (
 	// has been revoked by the time this is returned.
 	ErrRefreshReuse = errors.New("refresh token reuse detected")
 
+	// ErrPasswordMismatch is returned when the supplied current password is
+	// wrong on a change-password request.
+	ErrPasswordMismatch = errors.New("current password is incorrect")
+	// ErrSessionNotFound covers both an unknown session and one belonging to
+	// another user — the two are deliberately indistinguishable.
+	ErrSessionNotFound = errors.New("session not found")
+
 	// errClaimMissed is internal: it unwinds the rotation transaction without
 	// treating the situation as a failure, so diagnosis can run outside it.
 	errClaimMissed = errors.New("refresh token claim matched no row")
@@ -39,20 +47,230 @@ type Service struct {
 	repo *Repository
 	jwt  *JWTService
 
+	mailer     Mailer
+	appBaseURL string
+	resetTTL   time.Duration
+
 	// refreshTTL is one token's lifetime; absoluteTTL caps the whole family,
 	// so rotating forever cannot keep a session alive indefinitely.
 	refreshTTL  time.Duration
 	absoluteTTL time.Duration
 }
 
-func NewService(db *pgxpool.Pool, repo *Repository, jwt *JWTService, refreshTTL, absoluteTTL time.Duration) *Service {
+// Mailer is the subset of pkg/mailer this package needs. Declaring it here
+// rather than importing keeps the dependency pointing inwards: the concrete
+// mailer is chosen in main.go, and tests can substitute a recorder.
+type Mailer interface {
+	SendPasswordReset(ctx context.Context, to, name, resetURL string) error
+}
+
+func NewService(db *pgxpool.Pool, repo *Repository, jwt *JWTService, refreshTTL, absoluteTTL time.Duration, m Mailer, appBaseURL string, resetTTL time.Duration) *Service {
 	return &Service{
 		db:          db,
 		repo:        repo,
 		jwt:         jwt,
 		refreshTTL:  refreshTTL,
 		absoluteTTL: absoluteTTL,
+		mailer:      m,
+		appBaseURL:  strings.TrimRight(appBaseURL, "/"),
+		resetTTL:    resetTTL,
 	}
+}
+
+// GetProfile returns the /api/auth/me view.
+func (s *Service) GetProfile(ctx context.Context, userID string) (Profile, error) {
+	u, phone, err := s.repo.GetProfile(ctx, s.db, userID)
+	if err != nil {
+		return Profile{}, err
+	}
+	return Profile{
+		ID: u.ID, Email: u.Email, Name: u.Name, Phone: phone, Role: u.Role,
+		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+	}, nil
+}
+
+func (s *Service) UpdateProfile(ctx context.Context, userID string, req UpdateProfileRequest) (Profile, error) {
+	if req.Name != nil && strings.TrimSpace(*req.Name) == "" {
+		return Profile{}, fmt.Errorf("%w: name cannot be empty", ErrValidation)
+	}
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		req.Name = &trimmed
+	}
+	if _, err := s.repo.UpdateProfile(ctx, s.db, userID, req.Name, req.Phone); err != nil {
+		return Profile{}, err
+	}
+	return s.GetProfile(ctx, userID)
+}
+
+// ChangePassword requires the current password even though the caller is
+// already authenticated: an access token may have been stolen, and this check
+// is what stops it being escalated into a permanent account takeover.
+//
+// Every OTHER session is revoked on success. If somebody else holds a session,
+// changing the password should evict them — while the caller stays signed in.
+func (s *Service) ChangePassword(ctx context.Context, userID string, req ChangePasswordRequest, currentRefreshToken string) error {
+	if err := validatePassword(req.NewPassword); err != nil {
+		return err
+	}
+
+	user, err := s.repo.GetUserByID(ctx, s.db, userID)
+	if err != nil {
+		return err
+	}
+	if err := VerifyPassword(user.PasswordHash, req.CurrentPassword); err != nil {
+		return ErrPasswordMismatch
+	}
+
+	hash, err := HashPassword(req.NewPassword)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+
+	// Resolve the caller's own family first so it can be spared.
+	keep := ""
+	if currentRefreshToken != "" {
+		if fam, err := s.repo.FamilyForToken(ctx, s.db, HashRefreshToken(currentRefreshToken)); err == nil {
+			keep = fam
+		}
+	}
+
+	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if err := s.repo.UpdatePasswordHash(ctx, tx, userID, hash); err != nil {
+			return err
+		}
+		if keep == "" {
+			// No identifiable current session, so end them all rather than
+			// leave a possibly-hostile one alive.
+			return s.repo.RevokeAllUserSessions(ctx, tx, userID)
+		}
+		return s.repo.RevokeOtherUserSessions(ctx, tx, userID, keep)
+	})
+}
+
+// ListSessions returns the user's live logins, marking the calling one.
+func (s *Service) ListSessions(ctx context.Context, userID, currentRefreshToken string) ([]SessionView, error) {
+	sessions, err := s.repo.ListSessions(ctx, s.db, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	current := ""
+	if currentRefreshToken != "" {
+		if fam, err := s.repo.FamilyForToken(ctx, s.db, HashRefreshToken(currentRefreshToken)); err == nil {
+			current = fam
+		}
+	}
+
+	out := make([]SessionView, 0, len(sessions))
+	for _, sess := range sessions {
+		out = append(out, SessionView{
+			ID: sess.ID, UserAgent: sess.UserAgent,
+			CreatedAt: sess.CreatedAt, LastActiveAt: sess.LastActiveAt,
+			Current: sess.ID != "" && sess.ID == current,
+		})
+	}
+	return out, nil
+}
+
+// RevokeSession ends one login. Scoped to the caller, so a user cannot revoke
+// somebody else's session even within the same business.
+func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) error {
+	n, err := s.repo.RevokeFamilyForUser(ctx, s.db, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Unknown, already revoked, or another user's: all one answer, so the
+		// response cannot be used to probe for other people's sessions.
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// ForgotPassword issues a reset link. It reports success whether or not the
+// address exists: any difference in status or body would turn this into an
+// account-enumeration oracle.
+func (s *Service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest) error {
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		return nil
+	}
+
+	user, err := s.repo.GetUserByEmail(ctx, s.db, email)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			return nil // silent by design
+		}
+		return err
+	}
+
+	plain, err := NewResetToken()
+	if err != nil {
+		return err
+	}
+
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		// Only the newest link may work; a second request must burn the first.
+		if err := s.repo.InvalidateResetTokens(ctx, tx, user.ID); err != nil {
+			return err
+		}
+		return s.repo.CreateResetToken(ctx, tx, user.ID,
+			HashResetToken(plain), time.Now().Add(s.resetTTL))
+	})
+	if err != nil {
+		return err
+	}
+
+	link := fmt.Sprintf("%s/reset-password?token=%s", s.appBaseURL, plain)
+	if err := s.mailer.SendPasswordReset(ctx, user.Email, user.Name, link); err != nil {
+		// The token is already stored, so a delivery failure is logged rather
+		// than surfaced — telling the caller would leak that the account exists.
+		log.Printf("send password reset to %s failed: %v", user.Email, err)
+	}
+	return nil
+}
+
+// ResetPassword redeems a token. Every session is revoked on success: whoever
+// forced the reset must not keep a live one.
+func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) error {
+	if strings.TrimSpace(req.Token) == "" {
+		return ErrResetTokenInvalid
+	}
+	if err := validatePassword(req.NewPassword); err != nil {
+		return err
+	}
+
+	hash, err := HashPassword(req.NewPassword)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+
+	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		userID, err := s.repo.ClaimResetToken(ctx, tx, HashResetToken(req.Token))
+		if err != nil {
+			return err
+		}
+		if err := s.repo.UpdatePasswordHash(ctx, tx, userID, hash); err != nil {
+			return err
+		}
+		return s.repo.RevokeAllUserSessions(ctx, tx, userID)
+	})
+}
+
+// CleanupExpiredResetTokens is called by the existing daily job.
+func (s *Service) CleanupExpiredResetTokens(ctx context.Context, grace time.Duration) (int64, error) {
+	return s.repo.DeleteExpiredResetTokens(ctx, s.db, grace)
+}
+
+func validatePassword(p string) error {
+	if len(p) < minPasswordLen {
+		return fmt.Errorf("%w: password must be at least %d characters", ErrValidation, minPasswordLen)
+	}
+	if len(p) > maxPasswordLen {
+		return fmt.Errorf("%w: password must be at most %d characters", ErrValidation, maxPasswordLen)
+	}
+	return nil
 }
 
 // issueRefreshToken mints a token and stores only its digest. An empty

@@ -25,6 +25,7 @@ import (
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
 	"github.com/Justdan111/credflow-api/internal/payments"
 	"github.com/Justdan111/credflow-api/pkg/database"
+	"github.com/Justdan111/credflow-api/pkg/mailer"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
@@ -48,6 +49,10 @@ func main() {
 	refreshAbsoluteTTL := envDuration("REFRESH_ABSOLUTE_TTL", 90*24*time.Hour)
 	allowedOrigins := envCSV("ALLOWED_ORIGINS", []string{"http://localhost:5173"})
 	cookieSecure := envBool("COOKIE_SECURE", true)
+	appBaseURL := envString("APP_BASE_URL", "http://localhost:5173")
+	// Short by design: a reset link is a bearer credential for taking over an
+	// account, so it should not sit valid in an inbox for long.
+	resetTTL := envDuration("PASSWORD_RESET_TTL", time.Hour)
 	maxConns := envInt32("DB_MAX_CONNS", 10)
 	minConns := envInt32("DB_MIN_CONNS", 2)
 	port := envString("PORT", "8080")
@@ -71,7 +76,11 @@ func main() {
 
 	jwtSvc := auth.NewJWTService(jwtSecret, jwtTTL)
 	authRepo := auth.NewRepository()
-	authSvc := auth.NewService(pool, authRepo, jwtSvc, refreshTTL, refreshAbsoluteTTL)
+	// ConsoleMailer logs the reset link instead of sending it. Swapping in a
+	// real provider is one new type satisfying the same interface.
+	mail := mailer.NewConsoleMailer()
+	authSvc := auth.NewService(pool, authRepo, jwtSvc, refreshTTL, refreshAbsoluteTTL,
+		mail, appBaseURL, resetTTL)
 	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: cookieSecure}, refreshTTL)
 
 	customerRepo := customers.NewRepository(pool)
@@ -121,9 +130,17 @@ func main() {
 		r.With(originCheck).Post("/refresh", authHandler.Refresh)
 		r.With(originCheck).Post("/logout", authHandler.Logout)
 
+		// Unauthenticated by necessity: a locked-out user has no token.
+		r.Post("/forgot-password", authHandler.ForgotPassword)
+		r.Post("/reset-password", authHandler.ResetPassword)
+
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
 			r.Get("/me", authHandler.Me)
+			r.Patch("/me", authHandler.UpdateMe)
+			r.With(originCheck).Post("/change-password", authHandler.ChangePassword)
+			r.Get("/sessions", authHandler.ListSessions)
+			r.With(originCheck).Delete("/sessions/{sessionId}", authHandler.RevokeSession)
 		})
 	})
 
@@ -259,13 +276,18 @@ func runTokenCleanup(ctx context.Context, svc *auth.Service) {
 			// Bound each sweep so a slow delete cannot outlive the interval.
 			sweepCtx, cancel := context.WithTimeout(ctx, time.Minute)
 			n, err := svc.CleanupExpiredTokens(sweepCtx, grace)
-			cancel()
 			if err != nil {
 				log.Printf("refresh token cleanup failed: %v", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				log.Printf("refresh token cleanup removed %d expired rows", n)
+			}
+			// Reset tokens are short-lived, so a much shorter grace is enough.
+			rn, rerr := svc.CleanupExpiredResetTokens(sweepCtx, 24*time.Hour)
+			cancel()
+			if rerr != nil {
+				log.Printf("reset token cleanup failed: %v", rerr)
+			} else if rn > 0 {
+				log.Printf("reset token cleanup removed %d expired rows", rn)
 			}
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
@@ -104,6 +106,119 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// UpdateMe changes the caller's own profile.
+func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		response.Fail(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	var req UpdateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Fail(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	out, err := h.svc.UpdateProfile(r.Context(), userID, req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	response.Success(w, http.StatusOK, out)
+}
+
+func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		response.Fail(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	var req ChangePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Fail(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	// The refresh cookie identifies the caller's own session so it can be
+	// spared while every other one is revoked.
+	currentRefresh, _ := ReadRefreshCookie(r)
+
+	if err := h.svc.ChangePassword(r.Context(), userID, req, currentRefresh); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		response.Fail(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	// The refresh cookie is scoped to /api/auth, so the browser sends it here
+	// and the current session can be flagged without extra plumbing.
+	currentRefresh, _ := ReadRefreshCookie(r)
+
+	out, err := h.svc.ListSessions(r.Context(), userID, currentRefresh)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	response.Success(w, http.StatusOK, out)
+}
+
+func (h *Handler) RevokeSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		response.Fail(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	sessionID := chi.URLParam(r, "sessionId")
+	if sessionID == "" {
+		response.Fail(w, http.StatusBadRequest, "sessionId is required")
+		return
+	}
+	if err := h.svc.RevokeSession(r.Context(), userID, sessionID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ForgotPassword always answers 202, whether or not the address exists. Any
+// difference in status or body would make this an account-enumeration oracle.
+func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
+	var req ForgotPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Fail(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := h.svc.ForgotPassword(r.Context(), req); err != nil {
+		// Even an internal failure must not reveal whether the account exists.
+		response.Success(w, http.StatusAccepted, map[string]string{
+			"message": "if that email is registered, a reset link has been sent",
+		})
+		return
+	}
+	response.Success(w, http.StatusAccepted, map[string]string{
+		"message": "if that email is registered, a reset link has been sent",
+	})
+}
+
+func (h *Handler) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	var req ResetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Fail(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := h.svc.ResetPassword(r.Context(), req); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	// The client must sign in again: every session was just revoked.
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrValidation):
@@ -120,6 +235,14 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		response.Fail(w, http.StatusUnauthorized, err.Error())
 	case errors.Is(err, ErrUserNotFound):
 		response.Fail(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrPasswordMismatch):
+		response.Fail(w, http.StatusUnauthorized, err.Error())
+	case errors.Is(err, ErrSessionNotFound):
+		response.Fail(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrResetTokenInvalid):
+		// One message for expired, used and unknown alike, so the response
+		// cannot be used to probe which tokens exist.
+		response.Fail(w, http.StatusBadRequest, err.Error())
 	default:
 		response.Fail(w, http.StatusInternalServerError, "internal server error")
 	}
