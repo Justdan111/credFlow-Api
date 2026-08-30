@@ -71,7 +71,11 @@ All configuration comes from the environment; `.env` is loaded at startup if pre
 | `DATABASE_URL` | yes | — | Postgres connection URI |
 | `JWT_SECRET` | yes | — | HMAC signing key; generate 64 random bytes |
 | `PORT` | no | `8080` | HTTP listen port |
-| `JWT_TTL` | no | `24h` | Access-token lifetime (Go duration) |
+| `JWT_TTL` | no | `15m` | Access-token lifetime (Go duration) |
+| `REFRESH_TTL` | no | `720h` | Refresh-token lifetime (30 days) |
+| `REFRESH_ABSOLUTE_TTL` | no | `2160h` | Hard ceiling on a session (90 days) |
+| `ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated exact origins for CORS |
+| `COOKIE_SECURE` | no | `true` | Send the refresh cookie over HTTPS only |
 | `DB_MAX_CONNS` | no | `10` | Connection-pool ceiling |
 | `DB_MIN_CONNS` | no | `2` | Connection-pool floor |
 | `APP_ENV` | no | `development` | Environment label |
@@ -153,11 +157,42 @@ List endpoints populate `meta`:
 
 ## Authentication & roles
 
-Register or log in to receive a JWT, then send it on every subsequent request:
+Register or log in to receive a **short-lived access token** (15 minutes) in the response
+body, plus a **long-lived refresh token** (30 days) in an httpOnly cookie. Send the access
+token on every subsequent request:
 
 ```
-Authorization: Bearer <token>
+Authorization: Bearer <accessToken>
 ```
+
+When it expires, call `POST /api/auth/refresh` — the browser sends the cookie
+automatically — to get a new one. `POST /api/auth/logout` ends the session.
+
+### Session model
+
+The refresh cookie is `HttpOnly`, `Secure`, `SameSite=Strict`, scoped to `Path=/api/auth`.
+JavaScript can never read it, so an XSS bug cannot steal a long-lived credential, and the
+browser never transmits it to any other endpoint.
+
+Refresh tokens **rotate**: each use retires the presented token and issues a successor.
+Every login opens an independent *family*, so sessions are per-device — logging out on a
+laptop leaves a phone signed in.
+
+If a **retired token is presented again**, that is either a stolen token being replayed or
+a client that lost a response. The two are indistinguishable, so the entire family is
+revoked and that device must log in again. Other devices are unaffected. A session also
+cannot outlive `REFRESH_ABSOLUTE_TTL` no matter how often it is refreshed.
+
+Only the digest of a token is ever stored. It is hashed with SHA-256 rather than bcrypt:
+a 256-bit random token has no dictionary to attack, so bcrypt's deliberate slowness would
+buy nothing, and its random salt would make the digest impossible to index or look up.
+
+### CORS
+
+Browser clients must be listed in `ALLOWED_ORIGINS`. The API echoes the exact matching
+origin and sets `Access-Control-Allow-Credentials: true`; a wildcard is never used, since
+browsers reject it on credentialed requests. `POST /refresh` and `POST /logout`
+additionally reject requests declaring a non-allowlisted `Origin`.
 
 Three roles exist, in ascending privilege: `member`, `admin`, `owner`. Read and create
 operations are open to any authenticated user; destructive and financial actions require
@@ -187,8 +222,10 @@ require a bearer token.
 
 | Method | Path | Role | Description |
 |---|---|---|---|
-| `POST` | `/api/auth/register` | — | Create a business and its owner account |
-| `POST` | `/api/auth/login` | — | Exchange credentials for a JWT |
+| `POST` | `/api/auth/register` | — | Create a business and its owner; opens a session |
+| `POST` | `/api/auth/login` | — | Exchange credentials for a session |
+| `POST` | `/api/auth/refresh` | cookie | Rotate the refresh token, get a new access token |
+| `POST` | `/api/auth/logout` | cookie | Revoke the current session |
 | `GET` | `/api/auth/me` | any | Current user and business |
 
 ### Customers

@@ -239,12 +239,12 @@ func TestPayments_validation(t *testing.T) {
 
 // debtRow is just the parts of a debt these tests need to read.
 type debtRow struct {
-	ID              string   `json:"id"`
-	Status          string   `json:"status"`
-	Amount          float64  `json:"amount"`
-	AmountPaid      float64  `json:"amountPaid"`
-	AmountRemaining float64  `json:"amountRemaining"`
-	PaidAt          *string  `json:"paidAt,omitempty"`
+	ID              string  `json:"id"`
+	Status          string  `json:"status"`
+	Amount          float64 `json:"amount"`
+	AmountPaid      float64 `json:"amountPaid"`
+	AmountRemaining float64 `json:"amountRemaining"`
+	PaidAt          *string `json:"paidAt,omitempty"`
 }
 
 func mustGetDebt(t *testing.T, baseURL, token, debtID string) debtRow {
