@@ -27,9 +27,11 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 }
 
 // debtSelect lists the stored columns plus three derived values:
-//   amount_paid       = SUM of active payments against this debt (0 if none)
-//   amount_remaining  = 0 when administratively marked paid, otherwise amount - amount_paid
-//   overdue           = due_date is past and the debt isn't paid
+//
+//	amount_paid       = SUM of active payments against this debt (0 if none)
+//	amount_remaining  = 0 when administratively marked paid, otherwise amount - amount_paid
+//	overdue           = due_date is past and the debt isn't paid
+//
 // The amount_paid subquery is correlated against the outer row by debts.id —
 // using the bare table name works in SELECT, INSERT...RETURNING, and
 // UPDATE...RETURNING contexts uniformly.
@@ -149,9 +151,12 @@ func (r *Repository) SoftDelete(ctx context.Context, businessID, id string) erro
 // requires status <> 'paid', so a second call affects 0 rows — we then
 // distinguish "not found" from "already paid" with a follow-up existence check.
 func (r *Repository) MarkPaid(ctx context.Context, businessID, id string) (Debt, error) {
+	// manually_marked_paid records that this is an administrative close, not a
+	// payment-derived one. RecomputeDebtStatus reads it to decide whether a
+	// later void may re-open the debt.
 	q := `
 		UPDATE debts
-		SET status = 'paid', paid_at = NOW()
+		SET status = 'paid', paid_at = NOW(), manually_marked_paid = true
 		WHERE business_id = $1 AND id = $2 AND deleted_at IS NULL AND status <> 'paid'
 		RETURNING ` + debtSelect
 
