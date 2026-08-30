@@ -68,7 +68,7 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (AuthRespon
 		return AuthResponse{}, fmt.Errorf("mint token: %w", err)
 	}
 
-	return AuthResponse{User: user, Business: biz, Token: token}, nil
+	return AuthResponse{User: user, Business: biz, AccessToken: token}, nil
 }
 
 func (s *Service) Login(ctx context.Context, req LoginRequest) (AuthResponse, error) {
@@ -100,7 +100,7 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (AuthResponse, er
 		return AuthResponse{}, fmt.Errorf("mint token: %w", err)
 	}
 
-	return AuthResponse{User: user, Business: biz, Token: token}, nil
+	return AuthResponse{User: user, Business: biz, AccessToken: token}, nil
 }
 
 func (s *Service) Me(ctx context.Context, userID string) (AuthResponse, error) {

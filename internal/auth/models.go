@@ -39,5 +39,25 @@ type LoginRequest struct {
 type AuthResponse struct {
 	User     User     `json:"user"`
 	Business Business `json:"business"`
-	Token    string   `json:"token,omitempty"`
+	// AccessToken is short-lived (15m by default). The long-lived refresh
+	// token is never in the body — it travels only in an httpOnly cookie so
+	// that JavaScript, and therefore XSS, can never read it.
+	AccessToken string `json:"accessToken,omitempty"`
+}
+
+// RefreshToken is one link in a rotation chain. The opaque token itself is
+// never stored or held here — only its SHA-256 digest reaches the database.
+type RefreshToken struct {
+	ID         string
+	UserID     string
+	BusinessID string
+	// FamilyID groups every token descended from a single login.
+	FamilyID string
+	// ExpiresAt is this link's own expiry; AbsoluteExpiresAt is the family's
+	// hard deadline, copied forward unchanged so rotation cannot extend it.
+	ExpiresAt         time.Time
+	AbsoluteExpiresAt time.Time
+	// UsedAt non-nil means retired by rotation; RevokedAt non-nil means killed.
+	UsedAt    *time.Time
+	RevokedAt *time.Time
 }
