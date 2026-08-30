@@ -63,6 +63,12 @@ func scanPayment(row pgx.Row) (Payment, error) {
 //   - the WHERE EXISTS failed (customer or debt not in tenant)        -> ErrCustomerNotFound or ErrDebtNotFound
 //   - the idempotency unique constraint fired (duplicate submission)  -> the existing row
 //     is returned and the bool "idempotentReplay" is true.
+//
+// idempotencySavepoint names the savepoint guarding the payment INSERT. A
+// fixed identifier is safe: savepoints are scoped to their transaction, and
+// re-declaring one inside the same transaction simply replaces it.
+const idempotencySavepoint = "sp_payment_insert"
+
 func (r *Repository) Create(ctx context.Context, db DBTX, businessID string, req CreateRequest, paidAt time.Time) (p Payment, idempotentReplay bool, err error) {
 	// We assemble the WHERE EXISTS clause based on whether debt_id is set.
 	// Without a debt the requirement is just "customer in this tenant and active".
@@ -109,13 +115,40 @@ func (r *Repository) Create(ctx context.Context, db DBTX, businessID string, req
 		RETURNING %s
 	`, debtIDExpr, existsClause, paymentSelect)
 
+	// The INSERT can violate the (business_id, idempotency_key) unique index on
+	// a replay. In Postgres a failed statement aborts the ENTIRE transaction —
+	// every later command returns 25P02 "current transaction is aborted" — so
+	// the replay lookup below would itself fail and the replay path would be
+	// unreachable. A savepoint scopes the failure to just this statement,
+	// leaving the surrounding transaction usable.
+	//
+	// Create must therefore be called inside a transaction: SAVEPOINT outside a
+	// transaction block is an error. Service.Create always opens one.
+	usingSavepoint := req.IdempotencyKey != ""
+	if usingSavepoint {
+		if _, spErr := db.Exec(ctx, "SAVEPOINT "+idempotencySavepoint); spErr != nil {
+			return Payment{}, false, fmt.Errorf("create savepoint: %w", spErr)
+		}
+	}
+
 	p, err = scanPayment(db.QueryRow(ctx, q, args...))
 	if err == nil {
+		if usingSavepoint {
+			// Releasing keeps the inserted row and discards the marker.
+			if _, relErr := db.Exec(ctx, "RELEASE SAVEPOINT "+idempotencySavepoint); relErr != nil {
+				return Payment{}, false, fmt.Errorf("release savepoint: %w", relErr)
+			}
+		}
 		return p, false, nil
 	}
 
 	// Idempotency replay path: same key already exists. Fetch and return it.
 	if isIdempotencyViolation(err) && req.IdempotencyKey != "" {
+		// Undo the failed INSERT so the transaction leaves its aborted state
+		// and the lookup below can actually run.
+		if _, rbErr := db.Exec(ctx, "ROLLBACK TO SAVEPOINT "+idempotencySavepoint); rbErr != nil {
+			return Payment{}, false, fmt.Errorf("rollback to savepoint: %w", rbErr)
+		}
 		existing, fetchErr := r.GetByIdempotencyKey(ctx, db, businessID, req.IdempotencyKey)
 		if fetchErr != nil {
 			return Payment{}, false, fetchErr
@@ -236,11 +269,18 @@ func (r *Repository) List(ctx context.Context, businessID string, q ListQuery, s
 // mark-paid debt was administratively closed, and voiding a payment against
 // it shouldn't silently undo that administrative action.
 func (r *Repository) RecomputeDebtStatus(ctx context.Context, db DBTX, businessID, debtID string) error {
+	// The guard below checks manually_marked_paid, NOT the current status.
+	//
+	// Checking status = 'paid' was the bug: it fired for every paid debt,
+	// including one that reached 'paid' purely through payments. Voiding the
+	// payment that settled such a debt then left it pinned to 'paid' while
+	// amount_paid dropped, so the ledger reported a debt as settled when it
+	// was not. Only an administrative close should survive a void.
 	q := `
 		WITH agg AS (
 			SELECT
 				d.amount AS debt_amount,
-				d.status AS current_status,
+				d.manually_marked_paid AS admin_closed,
 				COALESCE((
 					SELECT SUM(p.amount) FROM payments p
 					WHERE p.debt_id = d.id AND p.deleted_at IS NULL
@@ -251,13 +291,13 @@ func (r *Repository) RecomputeDebtStatus(ctx context.Context, db DBTX, businessI
 		UPDATE debts d
 		SET
 			status = CASE
-				WHEN (SELECT current_status FROM agg) = 'paid' THEN 'paid'   -- preserve mark-paid
+				WHEN (SELECT admin_closed FROM agg) THEN 'paid'   -- administrative close survives
 				WHEN (SELECT total_paid FROM agg) >= (SELECT debt_amount FROM agg) THEN 'paid'
 				WHEN (SELECT total_paid FROM agg) > 0 THEN 'partial'
 				ELSE 'pending'
 			END,
 			paid_at = CASE
-				WHEN (SELECT current_status FROM agg) = 'paid' THEN d.paid_at  -- preserve original mark-paid timestamp
+				WHEN (SELECT admin_closed FROM agg) THEN d.paid_at  -- keep the original close timestamp
 				WHEN (SELECT total_paid FROM agg) >= (SELECT debt_amount FROM agg) THEN NOW()
 				ELSE NULL
 			END
