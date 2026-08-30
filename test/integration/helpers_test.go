@@ -27,18 +27,27 @@ import (
 	"github.com/Justdan111/credflow-api/internal/testutil"
 )
 
+const (
+	testRefreshTTL  = 30 * 24 * time.Hour
+	testAbsoluteTTL = 90 * 24 * time.Hour
+)
+
+var testAllowedOrigins = []string{"http://localhost:5173"}
+
 // newTestServer wires the same stack main.go does, against the test database,
 // and returns the URL it's listening on. The server is closed automatically
 // when the test ends.
 func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewTestDB(t)
-	testutil.Truncate(t, pool, "payments", "debts", "customers", "users", "businesses")
+	testutil.Truncate(t, pool, "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
 
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
-	authSvc := auth.NewService(pool, auth.NewRepository(), jwtSvc)
-	authHandler := auth.NewHandler(authSvc)
+	authSvc := auth.NewService(pool, auth.NewRepository(), jwtSvc, testRefreshTTL, testAbsoluteTTL)
+	// Secure:false — httptest serves plain http, so a Secure cookie would
+	// never be stored by the client.
+	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL)
 
 	customerHandler := customers.NewHandler(customers.NewService(customers.NewRepository(pool)))
 	debtRepo := debts.NewRepository(pool)
@@ -48,9 +57,13 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	r := chi.NewRouter()
 	r.Use(chimiddleware.Recoverer)
 
+	originCheck := appmiddleware.RequireAllowedOrigin(testAllowedOrigins)
+
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.Register)
 		r.Post("/login", authHandler.Login)
+		r.With(originCheck).Post("/refresh", authHandler.Refresh)
+		r.With(originCheck).Post("/logout", authHandler.Logout)
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
 			r.Get("/me", authHandler.Me)
@@ -160,13 +173,13 @@ func registerAndLogin(t *testing.T, baseURL, email string) string {
 		t.Fatalf("register: status %d, body %s", status, raw)
 	}
 	var data struct {
-		Token string `json:"token"`
+		AccessToken string `json:"accessToken"`
 	}
 	if err := json.Unmarshal(env.Data, &data); err != nil {
 		t.Fatalf("decode register response: %v", err)
 	}
-	if data.Token == "" {
-		t.Fatal("register: token missing from response")
+	if data.AccessToken == "" {
+		t.Fatal("register: accessToken missing from response")
 	}
-	return data.Token
+	return data.AccessToken
 }

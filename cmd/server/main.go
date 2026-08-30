@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,7 +39,13 @@ func main() {
 
 	dbURL := mustEnv("DATABASE_URL")
 	jwtSecret := mustEnv("JWT_SECRET")
-	jwtTTL := envDuration("JWT_TTL", 24*time.Hour)
+	// 15 minutes, not 24 hours: the whole point of refresh tokens is a short
+	// window in which a stolen access token is useful.
+	jwtTTL := envDuration("JWT_TTL", 15*time.Minute)
+	refreshTTL := envDuration("REFRESH_TTL", 30*24*time.Hour)
+	refreshAbsoluteTTL := envDuration("REFRESH_ABSOLUTE_TTL", 90*24*time.Hour)
+	allowedOrigins := envCSV("ALLOWED_ORIGINS", []string{"http://localhost:5173"})
+	cookieSecure := envBool("COOKIE_SECURE", true)
 	maxConns := envInt32("DB_MAX_CONNS", 10)
 	minConns := envInt32("DB_MIN_CONNS", 2)
 	port := envString("PORT", "8080")
@@ -62,8 +69,8 @@ func main() {
 
 	jwtSvc := auth.NewJWTService(jwtSecret, jwtTTL)
 	authRepo := auth.NewRepository()
-	authSvc := auth.NewService(pool, authRepo, jwtSvc)
-	authHandler := auth.NewHandler(authSvc)
+	authSvc := auth.NewService(pool, authRepo, jwtSvc, refreshTTL, refreshAbsoluteTTL)
+	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: cookieSecure}, refreshTTL)
 
 	customerRepo := customers.NewRepository(pool)
 	customerSvc := customers.NewService(customerRepo)
@@ -80,6 +87,9 @@ func main() {
 	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
 	r := chi.NewRouter()
+	// CORS must run before anything that can short-circuit, so even error
+	// responses carry the headers a browser needs to read them.
+	r.Use(appmiddleware.CORS(allowedOrigins))
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Logger)
@@ -89,9 +99,18 @@ func main() {
 	r.Get("/health", app.handleHealth)
 	r.Get("/health/db", app.handleHealthDB)
 
+	// Defence in depth behind SameSite=Strict on the state-changing token
+	// endpoints. Reads are not guarded: they carry no cookie-backed authority.
+	originCheck := appmiddleware.RequireAllowedOrigin(allowedOrigins)
+
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.Register)
 		r.Post("/login", authHandler.Login)
+
+		// Deliberately outside RequireAuth: refresh must work precisely when
+		// the access token has expired. The httpOnly cookie is the credential.
+		r.With(originCheck).Post("/refresh", authHandler.Refresh)
+		r.With(originCheck).Post("/logout", authHandler.Logout)
 
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
@@ -142,6 +161,12 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// appCtx is cancelled on shutdown so background workers stop with the
+	// server rather than being killed mid-query.
+	appCtx, cancelApp := context.WithCancel(context.Background())
+	defer cancelApp()
+	go runTokenCleanup(appCtx, authSvc)
+
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("CredFlow API listening on %s", addr)
@@ -160,6 +185,8 @@ func main() {
 		log.Printf("received signal %s — shutting down server...", sig)
 	}
 
+	cancelApp() // stop background workers before draining connections
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -167,6 +194,38 @@ func main() {
 		log.Fatalf("graceful shutdown failed: %v", err)
 	}
 	log.Println("server stopped cleanly")
+}
+
+// runTokenCleanup purges long-expired refresh tokens once a day. Rows are kept
+// for a grace period past expiry so reuse detection can still recognise a
+// replayed token instead of dismissing it as unknown.
+func runTokenCleanup(ctx context.Context, svc *auth.Service) {
+	const (
+		interval = 24 * time.Hour
+		grace    = 30 * 24 * time.Hour
+	)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Bound each sweep so a slow delete cannot outlive the interval.
+			sweepCtx, cancel := context.WithTimeout(ctx, time.Minute)
+			n, err := svc.CleanupExpiredTokens(sweepCtx, grace)
+			cancel()
+			if err != nil {
+				log.Printf("refresh token cleanup failed: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("refresh token cleanup removed %d expired rows", n)
+			}
+		}
+	}
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -189,6 +248,37 @@ func envString(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envCSV reads a comma-separated list, e.g. ALLOWED_ORIGINS.
+func envCSV(key string, fallback []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
+}
+
+func envBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Fatalf("env %s: invalid bool %q: %v", key, v, err)
+	}
+	return b
 }
 
 func envInt32(key string, fallback int32) int32 {

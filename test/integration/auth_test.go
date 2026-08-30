@@ -24,14 +24,14 @@ func TestAuth_registerLoginMe(t *testing.T) {
 	}
 
 	var registered struct {
-		User     struct{ ID, Email, Name, Role string } `json:"user"`
-		Business struct{ ID, Name string }              `json:"business"`
-		Token    string                                 `json:"token"`
+		User        struct{ ID, Email, Name, Role string } `json:"user"`
+		Business    struct{ ID, Name string }              `json:"business"`
+		AccessToken string                                 `json:"accessToken"`
 	}
 	if err := json.Unmarshal(env.Data, &registered); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if registered.User.ID == "" || registered.Business.ID == "" || registered.Token == "" {
+	if registered.User.ID == "" || registered.Business.ID == "" || registered.AccessToken == "" {
 		t.Fatalf("incomplete register response: %+v", registered)
 	}
 	if registered.User.Role != "owner" {
@@ -53,17 +53,17 @@ func TestAuth_registerLoginMe(t *testing.T) {
 		t.Fatalf("login: %d", loginStatus)
 	}
 	var loggedIn struct {
-		Token string `json:"token"`
+		AccessToken string `json:"accessToken"`
 	}
 	if err := json.Unmarshal(loginEnv.Data, &loggedIn); err != nil {
 		t.Fatalf("decode login: %v", err)
 	}
-	if loggedIn.Token == "" {
-		t.Fatal("login: token missing")
+	if loggedIn.AccessToken == "" {
+		t.Fatal("login: accessToken missing")
 	}
 
 	// 4. /me with the token returns the user.
-	meStatus, meEnv, _ := doJSON(t, http.MethodGet, baseURL+"/api/auth/me", loggedIn.Token, nil)
+	meStatus, meEnv, _ := doJSON(t, http.MethodGet, baseURL+"/api/auth/me", loggedIn.AccessToken, nil)
 	if meStatus != http.StatusOK {
 		t.Fatalf("me: %d", meStatus)
 	}
