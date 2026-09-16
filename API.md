@@ -1,5 +1,8 @@
 # API reference
 
+| [Overview](README.md) | API reference | [Architecture](ARCHITECTURE.md) |
+|:---:|:---:|:---:|
+
 The full contract: envelope, authentication, every route, and the security
 rules that apply to them. `README.md` covers getting the server running.
 
@@ -472,3 +475,8 @@ respectively, which breaks a client that parses every response as JSON. A panic 
 quotes the request id so a bug report can be matched to the logged stack; nothing about
 the panic itself is returned, since the value may name a table, a path, or another
 tenant's data.
+
+---
+
+| [Overview](README.md) | API reference | [Architecture](ARCHITECTURE.md) |
+|:---:|:---:|:---:|

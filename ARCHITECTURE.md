@@ -1,5 +1,8 @@
 # Architecture
 
+| [Overview](README.md) | [API reference](API.md) | Architecture |
+|:---:|:---:|:---:|
+
 How the CredFlow API is put together, and why it is put together that way.
 [README.md](README.md) covers running it; [API.md](API.md) is the route
 reference. This document is about the reasoning.
@@ -354,3 +357,8 @@ rescheduling and waivers, and an aggregate settings resource.
 `ConsoleMailer` logs reset and invitation links instead of sending them, so the
 whole recovery flow is exercisable locally with no vendor. A real provider is one
 type satisfying the same interface, swapped in at wiring time.
+
+---
+
+| [Overview](README.md) | [API reference](API.md) | Architecture |
+|:---:|:---:|:---:|
