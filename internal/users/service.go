@@ -1,9 +1,4 @@
-// Package users manages a business's team.
-//
-// Three roles have existed since the first migration and RequireRole enforces
-// them, but until this package there was no way to create a second user: the
-// only call to CreateUser was in register, always with `owner`. The role system
-// was unreachable in practice.
+// Package users manages a business's team: invitations, roles and removal.
 package users
 
 import (
@@ -21,15 +16,12 @@ import (
 
 var (
 	ErrValidation = errors.New("validation failed")
-	// ErrEscalation guards the rule that makes admin meaningfully weaker than
-	// owner. Without it, an admin could mint an owner and inherit every power
-	// they were not granted.
+	// Without this an admin could mint an owner and inherit every power they
+	// were not granted.
 	ErrEscalation = errors.New("you cannot grant a role higher than your own")
-	// ErrLastOwner stops a business being left with nobody who can administer
-	// it — a state only direct database access could repair.
+	// A business with no owner can only be repaired with database access.
 	ErrLastOwner = errors.New("a business must keep at least one owner")
-	// ErrSelfTarget covers removing your own account: a foot-gun for a real
-	// user, and for a stolen token a way to cover its tracks.
+	// Removing your own account is a foot-gun, and a way to cover tracks.
 	ErrSelfTarget = errors.New("you cannot remove your own account")
 )
 
@@ -38,24 +30,17 @@ const (
 	maxPageSize     = 100
 )
 
-// roleRank orders the roles so "not higher than mine" is one comparison rather
-// than a table of special cases.
+// roleRank makes "not higher than mine" one comparison.
 var roleRank = map[string]int{
 	auth.RoleMember: 1,
 	auth.RoleAdmin:  2,
 	auth.RoleOwner:  3,
 }
 
-// Inviter issues the password-reset link a new member uses to choose their own
-// credential.
-//
-// Declared here, in the consumer, so this package depends on a two-method
-// interface rather than on the whole auth service — and so a test can record
-// invitations without sending anything.
+// Inviter issues the link a new member uses to choose their own credential.
+// Declared in the consumer so a test can record invitations without sending any.
 type Inviter interface {
-	// SendInvitation issues a single-use reset token for the user and mails the
-	// link. It reuses the password-reset machinery deliberately: one token
-	// type, one expiry policy, one redemption path to get right.
+	// Reuses the password-reset machinery: one token type, one redemption path.
 	SendInvitation(ctx context.Context, userID, email, name, invitedByName string) error
 }
 
@@ -63,8 +48,7 @@ type Service struct {
 	db      *pgxpool.Pool
 	repo    *Repository
 	inviter Inviter
-	// sessions revokes a removed member's live tokens. Same reasoning as
-	// Inviter: a narrow interface, declared by the consumer.
+	// Revokes a removed member's live tokens.
 	sessions SessionRevoker
 }
 
@@ -99,12 +83,8 @@ func (s *Service) Get(ctx context.Context, businessID, userID string) (Member, e
 	return s.repo.Get(ctx, businessID, userID)
 }
 
-// Invite creates a member and mails them a link to set their own password.
-//
-// The row is created with a password nobody holds — see randomPassword — so
-// the account exists but cannot be signed into until the invitee redeems the
-// link. That avoids the pattern where an administrator picks somebody else's
-// password and sends it over a chat app, where it stays forever.
+// Invite creates a member with a password nobody holds and mails them a link to
+// set their own, so no administrator ever chooses somebody else's password.
 func (s *Service) Invite(
 	ctx context.Context, businessID, actorID, actorRole, actorName string, req InviteRequest,
 ) (Member, error) {
@@ -112,9 +92,7 @@ func (s *Service) Invite(
 		return Member{}, err
 	}
 
-	// A password of 32 random bytes that is hashed and immediately discarded.
-	// The account is unusable until the invitee sets their own, and there is no
-	// window in which a default or guessable credential exists.
+	// Hashed and discarded: no window in which a guessable credential exists.
 	hash, err := randomPasswordHash()
 	if err != nil {
 		return Member{}, err
@@ -125,9 +103,7 @@ func (s *Service) Invite(
 		return Member{}, err
 	}
 
-	// Delivery failure does not roll back the member: an admin can re-invite,
-	// which issues a fresh token, exactly as requesting a second reset link
-	// does. Failing here would leave the caller unsure whether the user exists.
+	// Delivery failure does not roll back the member; an admin can re-invite.
 	if err := s.inviter.SendInvitation(ctx, member.ID, member.Email, member.Name, actorName); err != nil {
 		return member, nil
 	}
@@ -162,8 +138,7 @@ func (s *Service) Update(
 	if err != nil {
 		return Member{}, err
 	}
-	// Demoting somebody who outranks you would let an admin strip an owner of
-	// the very authority that put them above the admin.
+	// An admin must not strip an owner of the authority that outranks them.
 	if roleRank[target.Role] > roleRank[actorRole] {
 		return Member{}, ErrEscalation
 	}
@@ -181,12 +156,10 @@ func (s *Service) Update(
 	return s.repo.Update(ctx, businessID, targetID, req.Name, &role)
 }
 
-// Remove soft-deletes a member and ends their sessions.
+// Remove soft-deletes a member and ends their sessions in one transaction.
 //
-// Both happen in one transaction: a removed user whose refresh token still
-// works is not removed. Their access token survives until it expires — at most
-// JWT_TTL, 15 minutes by default — because a stateless token cannot be recalled.
-// That is the price of stateless auth, and the short TTL is what bounds it.
+// Their access token survives until it expires — at most JWT_TTL — because a
+// stateless token cannot be recalled. The short TTL is what bounds that.
 func (s *Service) Remove(ctx context.Context, businessID, actorID, actorRole, targetID string) error {
 	if actorID == targetID {
 		return ErrSelfTarget
@@ -202,8 +175,7 @@ func (s *Service) Remove(ctx context.Context, businessID, actorID, actorRole, ta
 
 	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		if target.Role == auth.RoleOwner {
-			// Counted inside the transaction so it cannot race a concurrent
-			// removal and leave zero owners behind.
+			// Counted inside the transaction so it cannot race another removal.
 			owners, err := s.repo.CountByRole(ctx, tx, businessID, auth.RoleOwner)
 			if err != nil {
 				return err
@@ -224,11 +196,8 @@ func (s *Service) ActorByID(ctx context.Context, userID string) (string, string,
 	return s.repo.ActorByID(ctx, userID)
 }
 
-// validateInvite normalises and checks the request in place, so Invite reads as
-// the sequence of writes it performs rather than a wall of guards.
-//
-// Role defaults to member: the least privilege that still lets somebody use the
-// product, so a forgotten field cannot quietly mint an administrator.
+// validateInvite normalises and checks the request in place. Role defaults to
+// member, so a forgotten field cannot quietly mint an administrator.
 func validateInvite(req *InviteRequest, actorRole string) error {
 	req.Email = strings.TrimSpace(req.Email)
 	req.Name = strings.TrimSpace(req.Name)
@@ -257,8 +226,7 @@ func checkGrant(actorRole, targetRole string) error {
 	return nil
 }
 
-// randomPasswordHash produces a hash of 32 random bytes. The plaintext is never
-// returned, logged, or stored — it exists only long enough to be hashed.
+// randomPasswordHash hashes 32 random bytes; the plaintext is never returned.
 func randomPasswordHash() (string, error) {
 	plain, err := auth.NewResetToken() // 256 bits, URL-safe
 	if err != nil {

@@ -1,10 +1,7 @@
-// Package search answers the one query the header search box asks: "find me
-// anything matching this text".
+// Package search matches a term across customers, debts and payments.
 //
-// It is a deliberately small feature. Postgres full-text search or a separate
-// index would be the answer at a different scale; at this one, a prefix and
-// substring match over three tables is both sufficient and honest about what it
-// does.
+// Deliberately small: full-text search or a separate index would be the answer
+// at a different scale; a substring match over three tables suffices at this one.
 package search
 
 import (
@@ -128,8 +125,7 @@ func (r *Repository) searchCustomers(ctx context.Context, businessID, pattern st
 }
 
 func (r *Repository) searchDebts(ctx context.Context, businessID, pattern string, limit int) ([]Result, error) {
-	// Joined to customers so searching a person's name finds their debts, which
-	// is what somebody typing into the header box actually wants.
+	// Joined to customers so a person's name finds their debts.
 	const q = `
 		SELECT d.id, c.name, COALESCE(d.description, ''), d.amount, d.due_date
 		FROM debts d
@@ -194,14 +190,11 @@ func (r *Repository) searchPayments(ctx context.Context, businessID, pattern str
 	return out, rows.Err()
 }
 
-// escapeLike neutralises the wildcards LIKE assigns special meaning.
+// escapeLike neutralises LIKE's wildcards, so "50%" finds a literal percent
+// rather than every row beginning "50". Not an injection risk — the term is
+// always a bind parameter — but a correctness one.
 //
-// Without this, searching for "50%" matches every row beginning "50", and "_"
-// matches any single character — so a user's literal text silently becomes a
-// pattern. This is not an injection risk (the term is always a bind parameter),
-// it is a correctness one: the search must find what was typed.
-//
-// The backslash is escaped first, or escaping the others would double-escape it.
+// The backslash goes first, or escaping the others would double-escape it.
 func escapeLike(term string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return replacer.Replace(term)

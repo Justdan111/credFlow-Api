@@ -1,44 +1,24 @@
 # CredFlow API
 
-A multi-tenant REST API for businesses to track money owed to them — customers, debts,
-and payments. Every business sees only its own data; tenant isolation is enforced at the
-query layer and covered by dedicated tests.
+Backend for CredFlow, a debt and collections tracker for African SMEs. A
+business records its customers, what each one owes, and the payments that come
+in against those debts — and gets a running picture of what is outstanding,
+what is overdue, and how collections are trending.
 
-Built in Go with `chi`, PostgreSQL, and JWT auth.
-
----
-
-## Table of contents
-
-- [Stack](#stack)
-- [Getting started](#getting-started)
-- [Configuration](#configuration)
-- [Developer commands](#developer-commands)
-- [Architecture](#architecture)
-- [Response envelope](#response-envelope)
-- [Authentication & roles](#authentication--roles)
-- [API reference](#api-reference)
-- [Testing](#testing)
-- [Project layout](#project-layout)
-
----
+Go and Postgres, no framework beyond a router. Every request belongs to one
+business, and every query is scoped to it.
 
 ## Stack
 
-| Concern | Choice |
+| | |
 |---|---|
 | Language | Go 1.25 |
-| HTTP router | `go-chi/chi/v5` |
-| Database | PostgreSQL 16 |
-| DB driver | `jackc/pgx/v5` (native pool) |
-| Migrations | `golang-migrate/migrate/v4` |
-| Auth | JWT (`golang-jwt/jwt/v5`) + bcrypt |
-
----
+| Router | chi v5 |
+| Database | PostgreSQL 16, pgx driver |
+| Migrations | golang-migrate, applied on startup |
+| Auth | JWT access tokens, rotating refresh tokens in an httpOnly cookie |
 
 ## Getting started
-
-**Prerequisites:** Go 1.25+, Docker (for Postgres), `psql`.
 
 ```bash
 # 1. Start Postgres
@@ -46,571 +26,69 @@ make db-up
 
 # 2. Configure
 cp .env.example .env
-# then set DATABASE_URL and generate a secret:
-#   openssl rand -base64 64
+#    Set DATABASE_URL, and generate a secret:
+#    openssl rand -base64 64
 
-# 3. Run — migrations are applied automatically on startup
+# 3. Run — migrations apply automatically
 make run
 ```
-
-The server listens on `:8080` by default.
 
 ```bash
 curl localhost:8080/health
 # {"data":{"status":"ok"},"meta":null,"error":null}
 ```
 
----
+For a browser client, set `ALLOWED_ORIGINS` to its exact origin and
+`COOKIE_SECURE=false` for local http. `.env.example` documents every variable.
 
-## Configuration
-
-All configuration comes from the environment; `.env` is loaded at startup if present.
-
-| Variable | Required | Default | Purpose |
-|---|:---:|---|---|
-| `DATABASE_URL` | yes | — | Postgres connection URI |
-| `JWT_SECRET` | yes | — | HMAC signing key; generate 64 random bytes |
-| `PORT` | no | `8080` | HTTP listen port |
-| `JWT_TTL` | no | `15m` | Access-token lifetime (Go duration) |
-| `REFRESH_TTL` | no | `720h` | Refresh-token lifetime (30 days) |
-| `REFRESH_ABSOLUTE_TTL` | no | `2160h` | Hard ceiling on a session (90 days) |
-| `ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated exact origins for CORS |
-| `COOKIE_SECURE` | no | `true` | Send the refresh cookie over HTTPS only |
-| `APP_BASE_URL` | no | `http://localhost:5173` | Frontend origin used to build reset links |
-| `PASSWORD_RESET_TTL` | no | `1h` | How long a reset link stays valid |
-| `TRUST_PROXY_HEADERS` | no | `false` | Honour `X-Forwarded-For` — only behind a proxy that overwrites it |
-| `MAX_REQUEST_BODY_BYTES` | no | `1048576` | Request body cap (1 MiB) |
-| `ENABLE_HSTS` | no | `true` | Send HSTS on TLS requests |
-
-Currency and the monthly collection target are stored per business, not configured
-here — see [Currency](#currency).
-| `DB_MAX_CONNS` | no | `10` | Connection-pool ceiling |
-| `DB_MIN_CONNS` | no | `2` | Connection-pool floor |
-| `APP_ENV` | no | `development` | Environment label |
-
-`DATABASE_URL` and `JWT_SECRET` are fatal if missing — the server refuses to start
-rather than run misconfigured.
-
----
-
-## Developer commands
-
-```
-make run               Start the server
-make build             Compile to ./bin/credflow
-make test              Unit tests only (fast, no DB)
-make test-integration  Integration tests (needs Postgres)
-make test-all          Every test
-make lint              go vet ./...
-make tidy              go mod tidy
-
-make db-up             Start the Postgres container
-make db-down           Stop the Postgres container
-make db-reset          Drop + recreate the credflow_test database
-```
-
----
-
-## Architecture
-
-Each feature is a self-contained package under `internal/` with the same four layers.
-Dependencies point in one direction only — a handler never touches the database, and a
-repository never knows about HTTP.
-
-```
-HTTP request
-    │
-    ▼
- handler.go      decode + validate input, write the JSON envelope
-    │
-    ▼
- service.go      business rules, defaults, authorization decisions
-    │
-    ▼
- repository.go   SQL, always scoped by business_id
-    │
-    ▼
- PostgreSQL
-```
-
-`models.go` in each package holds the domain types and request/response shapes shared
-across the three layers.
-
-**Multi-tenancy.** Every authenticated request carries a `business_id` resolved from the
-JWT. Repository queries filter on it unconditionally, so a row belonging to another
-tenant is not merely hidden — it is unreachable. `test/integration/tenant_isolation_test.go`
-asserts that no cross-tenant access path returns a success status.
-
----
-
-## Response envelope
-
-Every response — success or failure — uses the same shape, so clients parse one format.
-
-```jsonc
-{
-  "data":  { },      // object, array, or {} on error
-  "meta":  null,     // pagination on list endpoints, else null
-  "error": null      // { "message": "...", "code": "..." } on failure
-}
-```
-
-List endpoints populate `meta`:
-
-```json
-{ "page": 1, "pageSize": 20, "total": 137 }
-```
-
----
-
-## Authentication & roles
-
-Register or log in to receive a **short-lived access token** (15 minutes) in the response
-body, plus a **long-lived refresh token** (30 days) in an httpOnly cookie. Send the access
-token on every subsequent request:
-
-```
-Authorization: Bearer <accessToken>
-```
-
-When it expires, call `POST /api/auth/refresh` — the browser sends the cookie
-automatically — to get a new one. `POST /api/auth/logout` ends the session.
-
-### Session model
-
-The refresh cookie is `HttpOnly`, `Secure`, `SameSite=Strict`, scoped to `Path=/api/auth`.
-JavaScript can never read it, so an XSS bug cannot steal a long-lived credential, and the
-browser never transmits it to any other endpoint.
-
-Refresh tokens **rotate**: each use retires the presented token and issues a successor.
-Every login opens an independent *family*, so sessions are per-device — logging out on a
-laptop leaves a phone signed in.
-
-If a **retired token is presented again**, that is either a stolen token being replayed or
-a client that lost a response. The two are indistinguishable, so the entire family is
-revoked and that device must log in again. Other devices are unaffected. A session also
-cannot outlive `REFRESH_ABSOLUTE_TTL` no matter how often it is refreshed.
-
-Only the digest of a token is ever stored. It is hashed with SHA-256 rather than bcrypt:
-a 256-bit random token has no dictionary to attack, so bcrypt's deliberate slowness would
-buy nothing, and its random salt would make the digest impossible to index or look up.
-
-### Account recovery
-
-`POST /api/auth/forgot-password` **always** returns `202` with the same body, whether or
-not the address is registered. Any difference in status, body or timing would turn it
-into an account-enumeration oracle.
-
-The link carries a 256-bit token; only its SHA-256 digest is stored, so a leaked database
-contains nothing redeemable. Tokens are **single-use** and expire after
-`PASSWORD_RESET_TTL` (default one hour) — a link left in an inbox must not stay valid.
-Requesting a second link invalidates the first.
-
-Redeeming a token **revokes every session** for that user: whoever forced the reset must
-not keep a live one. `POST /api/auth/change-password` revokes every *other* session and
-leaves the caller signed in, and requires the current password even though the caller is
-already authenticated — a stolen access token must not be enough to take an account over.
-
-`PATCH /api/auth/me` deliberately cannot change the email address: a login identifier
-needs its own verification flow.
-
-### Email delivery
-
-Password recovery sends mail through a small `Mailer` interface. The default
-implementation logs the link to the application log, so the whole flow works in
-development with no external service. A real provider is one type satisfying the same
-interface, wired in `cmd/server/main.go`.
-
-`APP_BASE_URL` (default `http://localhost:5173`) builds the link the frontend consumes.
-
-### CORS
-
-Browser clients must be listed in `ALLOWED_ORIGINS`. The API echoes the exact matching
-origin and sets `Access-Control-Allow-Credentials: true`; a wildcard is never used, since
-browsers reject it on credentialed requests. `POST /refresh` and `POST /logout`
-additionally reject requests declaring a non-allowlisted `Origin`.
-
-Three roles exist, in ascending privilege: `member`, `admin`, `owner`. Read and create
-operations are open to any authenticated user; destructive and financial actions require
-elevation.
-
-| Action | Minimum role |
-|---|---|
-| Read anything, create customers/debts/payments, write customer notes | `member` |
-| Delete a customer, update or delete a debt, correct a payment, retract a note | `admin` |
-| Invite a teammate, change a role, read the audit trail | `admin` |
-| Delete (void) a payment, remove a teammate | `owner` |
-
-Three rules constrain team management, so privilege cannot be escalated sideways:
-nobody may grant a role above their own, the last `owner` cannot be demoted or
-removed, and nobody may remove their own account.
-
----
-
-## API reference
-
-`{id}` path parameters are UUIDs. All `/api/*` routes except `register` and `login`
-require a bearer token.
-
-### Health
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Liveness — process is up |
-| `GET` | `/health/db` | Readiness — database reachable |
-
-### Auth
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `POST` | `/api/auth/register` | — | Create a business and its owner; opens a session |
-| `POST` | `/api/auth/login` | — | Exchange credentials for a session |
-| `POST` | `/api/auth/refresh` | cookie | Rotate the refresh token, get a new access token |
-| `POST` | `/api/auth/logout` | cookie | Revoke the current session |
-| `POST` | `/api/auth/forgot-password` | — | Request a reset link (always `202`) |
-| `POST` | `/api/auth/reset-password` | — | Redeem a reset token |
-| `GET` | `/api/auth/me` | any | Current user and business |
-| `PATCH` | `/api/auth/me` | any | Update name and phone |
-| `POST` | `/api/auth/change-password` | any | Change password; evicts other sessions |
-| `GET` | `/api/auth/sessions` | any | Active logins, with the current one flagged |
-| `DELETE` | `/api/auth/sessions/{sessionId}` | any | Revoke one session |
-
-### Business & onboarding
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/businesses/current` | any | The active business profile |
-| `PATCH` | `/api/businesses/current` | admin | Update name, industry, size, currency, collection target |
-| `GET` | `/api/onboarding/status` | any | Completion state and the step to resume at |
-| `POST` | `/api/onboarding/complete` | any | Persist the whole onboarding flow in one transaction |
-
-`PATCH` is a partial update: an omitted key is left unchanged, while an explicit
-`"monthlyCollectionTarget": null` clears the target.
-
-`POST /api/onboarding/complete` takes the three-step payload — business profile, an
-optional first customer, an optional first debt — and applies all of it atomically. A
-debt without a customer is a `400`, since there would be nobody to owe it. Calling it
-again returns `409` rather than creating a second "first" customer on a double submit.
-
-`GET /api/onboarding/status` derives each step from real records rather than a stored
-counter, so it cannot drift out of sync with what the business actually has.
-
-### Customers
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/customers` | any | List — paginated, sortable, searchable |
-| `POST` | `/api/customers` | any | Create |
-| `GET` | `/api/customers/{customerId}` | any | Fetch one |
-| `PATCH` | `/api/customers/{customerId}` | any | Partial update |
-| `DELETE` | `/api/customers/{customerId}` | admin | Soft-delete |
-| `GET` | `/api/customers/{customerId}/debts` | any | Debts for a customer |
-| `GET` | `/api/customers/{customerId}/payments` | any | Payments for a customer |
-
-### Debts
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/debts` | any | List — paginated, sortable, filterable |
-| `POST` | `/api/debts` | any | Create |
-| `GET` | `/api/debts/{debtId}` | any | Fetch one |
-| `PATCH` | `/api/debts/{debtId}` | admin | Partial update |
-| `DELETE` | `/api/debts/{debtId}` | admin | Soft-delete |
-| `POST` | `/api/debts/{debtId}/mark-paid` | any | Settle in full |
-| `POST` | `/api/debts/{debtId}/payments` | any | Record a payment against this debt |
-
-Each debt returns `amount_paid` and `amount_remaining` derived from its payments, so the
-two can never drift out of sync with the ledger.
-
-### Dashboard
-
-Aggregations for the dashboard landing screen. All are read-only and tenant-scoped.
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/dashboard/summary` | any | Outstanding, overdue, customers and collected, each with a month-over-month change |
-| `GET` | `/api/dashboard/recent-debts` | any | Latest debts with customer name and days overdue (`limit`, max 20) |
-| `GET` | `/api/dashboard/recent-payments` | any | Latest payments with customer name (`limit`, max 20) |
-| `GET` | `/api/dashboard/risk-distribution` | any | Current low/medium/high customer split |
-| `GET` | `/api/dashboard/collections-trend` | any | Monthly collections and closing balance (`months`, max 24) |
-
-### Analytics
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/analytics/collection-rate` | any | Monthly collections against the business target |
-| `GET` | `/api/analytics/risk-trend` | any | Risk distribution over time, from daily snapshots |
-| `GET` | `/api/analytics/customer-segments` | any | Customers bucketed by lifetime debt value |
-| `GET` | `/api/analytics/export` | any | CSV of the trend and rate series (`format=csv`) |
-
-**Percentage change is `null` when the previous period was zero.** A change from zero is
-undefined, so the API reports nothing rather than an invented `+100%` that would make
-every new business look like it were booming.
-
-**The risk trend depends on recorded history.** `risk_level` is a mutable field, so past
-months cannot be reconstructed — a daily job records the distribution as it happens. The
-response carries `meta.historyStartedAt` and `meta.monthsAvailable` so a client can tell
-a short series caused by young history from one caused by having no customers. The
-current month is computed live, so a business that registered since the last run sees its
-position immediately.
-
-### Payments
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/payments` | any | List — paginated, sortable, filterable |
-| `POST` | `/api/payments` | any | Record a payment |
-| `GET` | `/api/payments/{paymentId}` | any | Fetch one |
-| `PATCH` | `/api/payments/{paymentId}` | admin | Correct amount, method, reference, notes or date |
-| `DELETE` | `/api/payments/{paymentId}` | owner | Void — rolls back the debt status |
-| `GET` | `/api/debts/{debtId}/payments` | any | Payments recorded against one debt |
-
-**Idempotency.** `POST` payment endpoints accept an idempotency key. A partial unique
-index on `(business_id, idempotency_key)` makes a replay return `200` with the original
-row instead of double-writing. Recording, correcting or voiding a payment updates the
-parent debt's status in the same transaction, so a crash mid-write cannot leave a debt
-disagreeing with its payments.
-
-A correction deliberately cannot move a payment to a different customer or debt: that
-would change two balances at once under a single opaque edit. Void it and record it
-again, which leaves both actions in the audit trail.
-
-### Team
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/users` | any | List teammates, with last activity |
-| `POST` | `/api/users` | admin | Invite a teammate by email |
-| `GET` | `/api/users/{userId}` | any | Fetch one teammate |
-| `PATCH` | `/api/users/{userId}` | admin | Change a name or role |
-| `DELETE` | `/api/users/{userId}` | owner | Remove a teammate and end their sessions |
-
-**Invitations reuse password recovery.** The new account is created with a random
-password nobody holds, then a normal single-use reset link is emailed. The invitee
-chooses their own credential through the flow that already exists — no administrator
-ever picks somebody else's password, and there is no second token type to get wrong.
-The response never contains the link: it is a credential for taking over that account,
-so it goes to the invitee's inbox and nowhere else.
-
-Removal ends the member's refresh tokens in the same transaction that soft-deletes them.
-Their access token stays valid until it expires — at most `JWT_TTL`, 15 minutes by
-default — because a stateless token cannot be recalled. That ceiling is the reason the
-TTL is short.
-
-### Customer notes
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/customers/{customerId}/notes` | any | Follow-up history, newest first |
-| `POST` | `/api/customers/{customerId}/notes` | any | Record a note, call, SMS, email or visit |
-| `DELETE` | `/api/notes/{noteId}` | admin | Retract a note |
-
-The author's name is captured on the row at write time, so attribution survives that
-teammate later being removed.
-
-### Audit trail
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/audit-logs` | admin | Who did what, newest first |
-
-Filterable by `action`, `entityType`, `entityId` and `actorId`. Recorded actions cover
-every destructive and financial operation: customer deleted; debt updated, deleted or
-marked paid; payment created, corrected or voided; business profile changed; teammate
-invited, promoted or removed; password changed. Reads are never recorded — a trail that
-logs every `GET` is noise nobody reads, and it would turn the audit screen into a record
-of when colleagues were at their desks.
-
-The table is append-only by construction: no `updated_at`, no trigger, and no update or
-delete path in the repository.
-
-**Limitation.** Entries are written after the action commits, and a failure to write one
-is logged rather than failing the request — the action already happened, so failing the
-response would report a lie. A strictly transactional trail would mean threading the
-transaction through every mutating service; that is the upgrade path when a compliance
-requirement demands it.
-
-### Search
-
-| Method | Path | Role | Description |
-|---|---|---|---|
-| `GET` | `/api/search?q=` | any | Customers, debts and payments matching a term |
-
-Substring match across customer name, email, company and phone; debt description; and
-payment reference and notes. Debts and payments also match on their customer's name,
-which is what somebody typing a person's name into a search box actually wants. Terms
-shorter than two characters are rejected, and `%` and `_` in a term are escaped so they
-match literally rather than acting as wildcards.
-
-### Query parameters
-
-Every list endpoint accepts `page` (default `1`) and `pageSize` (default `20`, clamped to
-a safe maximum), plus `sort`. `sort` takes an API field name, optionally prefixed with
-`-` for descending; values are checked against a per-resource whitelist before reaching
-SQL, so an unknown or hostile value is rejected rather than interpolated.
-
-| Endpoint | Additional parameters |
-|---|---|
-| `GET /api/customers` | `search` (name/contact substring), `riskLevel` |
-| `GET /api/debts` | `status`, `customerId`, `overdue=true` |
-| `GET /api/payments` | `customerId`, `debtId`, `method` |
-| `GET /api/users` | `role` |
-| `GET /api/customers/{id}/notes` | `channel` |
-| `GET /api/audit-logs` | `action`, `entityType`, `entityId`, `actorId` |
-| `GET /api/search` | `q` (required, 2+ characters), `limit` |
+## Commands
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" \
-  "localhost:8080/api/debts?status=pending&overdue=true&sort=-due_date&pageSize=50"
-```
-
----
-
-## Currency
-
-Each business has one currency, set on the business record and defaulting to `NGN`.
-Supported values are `NGN`, `GHS`, `KES`, `ZAR` and `USD`. Every aggregate response
-echoes it, so clients never hard-code a symbol.
-
-One currency per business rather than per debt keeps every total valid without exchange
-rates: summing across currencies would be meaningless, and an SME almost always invoices
-in one. `monthly_collection_target` is optional and nullable — a target is a business
-decision, so the API returns `null` when none is set rather than inventing one.
-
-Money is stored as `NUMERIC(14,2)`, and every total, average and comparison is computed
-in SQL where that arithmetic is exact.
-
-### Currency is locked once money exists
-
-Amounts carry no currency of their own — they inherit the business's. Changing the
-business currency therefore **converts nothing**: a debt recorded as ₦2,500,000 would
-afterwards read as ₵2,500,000.
-
-So the currency is freely settable while the business has no debts and no payments —
-which is exactly when the choice is made, during onboarding — and returns `409`
-afterwards. `GET /api/businesses/current` reports `currencyLocked`, so a client can
-disable the selector rather than offer a change the API will reject.
-
-`monthlyCollectionTarget` has no such constraint and stays editable at any time.
-
-## Rate limiting
-
-Every endpoint is throttled. Exceeding a limit returns `429` with `Retry-After` in
-seconds.
-
-| Endpoint | Limit | Keyed on |
-|---|---|---|
-| `POST /api/auth/login` | 5 / minute | IP **+** email |
-| `POST /api/auth/register` | 10 / hour | IP |
-| `POST /api/auth/forgot-password` | 3 / hour | email |
-| `POST /api/auth/forgot-password` | 20 / hour | IP |
-| `POST /api/auth/reset-password` | 10 / hour | IP |
-| `POST /api/auth/refresh` | 30 / minute | IP |
-| Any authenticated request | 300 / minute | user |
-| Authenticated `POST`/`PATCH`/`DELETE` | 60 / minute | user |
-| `POST /api/users` (invitations) | 20 / hour | business |
-
-**Authenticated traffic is keyed on the user, not the address.** Behind carrier-grade
-NAT an IP key would let one busy colleague throttle everybody in the office, and the user
-id is also what a stolen token impersonates — which is the thing worth capping. The
-numbers are a blast radius, not a business rule: somebody importing a customer list must
-never notice them. Reads and writes count separately, so a polling dashboard cannot
-exhaust the allowance that protects writes. Invitations are keyed on the business because
-the shared resource they consume is the sending domain's reputation, not one admin's
-quota.
-
-**Login is keyed on IP *and* email together.** Carrier-grade NAT is widespread on African
-mobile networks, so many unrelated subscribers share one public address — an IP-only
-limit would let one person's failed logins lock out everybody behind the same operator.
-`forgot-password` is keyed per address for the same reason, with a loose per-IP ceiling
-behind it to stop bulk abuse. Nothing hard-locks: every window rolls, so a targeted user
-can always recover within the hour.
-
-Counters are held **in process**. With multiple replicas the effective limit is roughly
-multiplied by the replica count, and a restart clears them. The `Limiter` interface exists
-so a shared Redis backend can replace the in-memory one without touching callers.
-
-### `TRUST_PROXY_HEADERS`
-
-Defaults to **false**, and should stay false unless a load balancer that overwrites
-`X-Forwarded-For` sits in front. When false the true TCP peer address is used and
-client-supplied headers are ignored entirely — otherwise a caller could forge a different
-address on every request and bypass every IP-based limit.
-
-## Security headers
-
-Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-`Referrer-Policy: strict-origin-when-cross-origin` and
-`Cross-Origin-Opener-Policy: same-origin`.
-
-`Strict-Transport-Security` is sent **only over TLS**, so local http development is not
-pinned to https in the browser. There is no Content-Security-Policy: this API returns
-JSON and never HTML.
-
-Request bodies are capped at `MAX_REQUEST_BODY_BYTES`; anything larger gets `413`.
-
-Requests carrying a body must declare `Content-Type: application/json`; anything else
-gets `415`. Bearer authentication already makes this API immune to browser form CSRF —
-a cross-site form cannot set an `Authorization` header — and this keeps it that way: an
-endpoint that silently accepts `text/plain` is the shape that becomes exploitable the day
-somebody adds cookie authentication for convenience.
-
-Path parameters are validated as UUIDs before a handler runs. Without that check a
-request for `/api/customers/not-a-uuid` reached Postgres, which refused the cast, and the
-client's mistake was reported as a `500`. The check is mounted on the route subtree that
-owns the id, so every route beneath it inherits the guarantee.
-
-**Every** failure answers in the JSON envelope, including an unrouted path (`404`), a
-wrong method (`405`) and a panic (`500`). chi's defaults send plain text and empty bodies
-respectively, which breaks a client that parses every response as JSON. A panic response
-quotes the request id so a bug report can be matched to the logged stack; nothing about
-the panic itself is returned, since the value may name a table, a path, or another
-tenant's data.
-
-## Testing
-
-Three tiers, all runnable locally:
-
-```bash
-make test              # unit — pure logic, no database
-make test-integration  # integration — full HTTP → service → repo → Postgres
+make run               # start the server
+make build             # compile to ./bin/credflow
+make test              # unit tests — fast, no database
+make test-integration  # integration tests — needs Postgres
 make test-all          # everything
+make lint              # go vet
+make db-up / db-down / db-reset
 ```
 
-Integration tests are guarded by the `integration` build tag and need a running Postgres;
-`make db-reset` gives them a clean `credflow_test` database. **They skip rather than fail
-when the database is unreachable**, so a green `make test-all` on a machine with no
-Docker means "nothing ran" — check the output for `SKIP` before trusting it. CI
-(`.github/workflows/test.yml`) runs build, vet, unit, and integration tests against a
-Postgres service container on every push.
+Integration tests **skip** rather than fail when the database is unreachable, so
+check the output for `SKIP` before trusting a green run.
 
----
-
-## Project layout
+## Layout
 
 ```
-cmd/server/          entrypoint — config, wiring, routes, graceful shutdown
+cmd/server/          config, wiring, routes, graceful shutdown
 internal/
-  auth/              register, login, JWT, password hashing, roles
+  auth/              register, login, JWT, password hashing, sessions
   users/             team management — invite, change role, remove
   audit/             append-only trail of destructive and financial actions
-  customers/         customer CRUD
-  notes/             customer follow-up history
-  debts/             debt CRUD, mark-paid, derived balances
-  payments/          payment recording, idempotency, correction, void
-  search/            cross-entity lookup for the header search box
-  analytics/         dashboard and analytics aggregates
   businesses/        business profile and onboarding
-  middleware/        auth, roles, CORS, rate limits, body/UUID/content-type guards
-  testutil/          database helpers for tests
-pkg/
-  database/          connection pool + migration runner
-  response/          the JSON envelope
+  customers/         customer records
+  notes/             customer follow-up history
+  debts/             debts, mark-paid, derived balances
+  payments/          recording, idempotency, correction, void
+  analytics/         dashboard and analytics aggregates
+  search/            cross-entity lookup
+  middleware/        auth, roles, CORS, rate limits, request guards
+pkg/                 database, mailer, rate limiter, JSON envelope
 migrations/          versioned .up.sql / .down.sql pairs
 test/integration/    end-to-end tests (build tag: integration)
 ```
 
----
+Each feature package has the same four layers — `handler` decodes and writes
+HTTP, `service` holds the rules, `repository` owns the SQL, `models` the types —
+and dependencies point one way only.
+
+## Documentation
+
+[**API.md**](API.md) is the full contract: every route, the response envelope,
+roles, currency rules and rate limits.
+
+Longer design notes — the endpoint catalogue, project guide, code walkthrough
+and per-phase specs — live in `docs/`, which `.gitignore` keeps local to the
+author's machine rather than in the repository.
 
 ## License
 
