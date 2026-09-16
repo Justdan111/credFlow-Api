@@ -1,5 +1,8 @@
 # CredFlow API
 
+| Overview | [API reference](API.md) | [Architecture](ARCHITECTURE.md) |
+|:---:|:---:|:---:|
+
 Backend for CredFlow, a debt and collections tracker for African SMEs. A
 business records its customers, what each one owes, and the payments that come
 in against those debts — and gets a running picture of what is outstanding,
@@ -83,8 +86,12 @@ and dependencies point one way only.
 
 ## Documentation
 
-[**API.md**](API.md) is the full contract: every route, the response envelope,
-roles, currency rules and rate limits.
+Use the strip at the top of any page to move between them.
+
+| | |
+|---|---|
+| [**API reference**](API.md) | The contract — envelope, auth, roles, every route, currency rules, rate limits |
+| [**Architecture**](ARCHITECTURE.md) | How the system is built and why — layering, tenancy, auth, money integrity, the audit trail |
 
 Longer design notes — the endpoint catalogue, project guide, code walkthrough
 and per-phase specs — live in `docs/`, which `.gitignore` keeps local to the
@@ -93,3 +100,8 @@ author's machine rather than in the repository.
 ## License
 
 All rights reserved.
+
+---
+
+| Overview | [API reference](API.md) | [Architecture](ARCHITECTURE.md) |
+|:---:|:---:|:---:|
