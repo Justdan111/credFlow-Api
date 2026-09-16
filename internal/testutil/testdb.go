@@ -34,14 +34,20 @@ func NewTestDB(t *testing.T) *pgxpool.Pool {
 		t.Skipf("test database unreachable (%v) — start Docker + create credflow_test db, or set TEST_DATABASE_URL", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Every test builds its own pool and closes it on cleanup. Postgres does
+	// not reap the backend the instant a client disconnects, so a large suite
+	// running back to back keeps more sockets alive than the count at rest
+	// suggests. Two small conns per test with a forgiving timeout keeps the
+	// suite well clear of max_connections instead of failing one test at random
+	// with "context deadline exceeded" — a flake that looks like a product bug.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	pool, err := database.Connect(ctx, database.Config{
 		URL:            dbURL,
-		MaxConns:       5,
+		MaxConns:       2,
 		MinConns:       1,
-		ConnectTimeout: 5 * time.Second,
+		ConnectTimeout: 15 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("connect test db: %v", err)

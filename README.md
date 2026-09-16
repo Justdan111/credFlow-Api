@@ -236,9 +236,14 @@ elevation.
 
 | Action | Minimum role |
 |---|---|
-| Read anything, create customers/debts/payments | `member` |
-| Delete a customer, update or delete a debt | `admin` |
-| Delete (void) a payment | `owner` |
+| Read anything, create customers/debts/payments, write customer notes | `member` |
+| Delete a customer, update or delete a debt, correct a payment, retract a note | `admin` |
+| Invite a teammate, change a role, read the audit trail | `admin` |
+| Delete (void) a payment, remove a teammate | `owner` |
+
+Three rules constrain team management, so privilege cannot be escalated sideways:
+nobody may grant a role above their own, the last `owner` cannot be demoted or
+removed, and nobody may remove their own account.
 
 ---
 
@@ -356,13 +361,86 @@ position immediately.
 | `GET` | `/api/payments` | any | List — paginated, sortable, filterable |
 | `POST` | `/api/payments` | any | Record a payment |
 | `GET` | `/api/payments/{paymentId}` | any | Fetch one |
+| `PATCH` | `/api/payments/{paymentId}` | admin | Correct amount, method, reference, notes or date |
 | `DELETE` | `/api/payments/{paymentId}` | owner | Void — rolls back the debt status |
+| `GET` | `/api/debts/{debtId}/payments` | any | Payments recorded against one debt |
 
 **Idempotency.** `POST` payment endpoints accept an idempotency key. A partial unique
 index on `(business_id, idempotency_key)` makes a replay return `200` with the original
-row instead of double-writing. Recording or voiding a payment updates the parent debt's
-status in the same transaction, so a crash mid-write cannot leave a debt disagreeing
-with its payments.
+row instead of double-writing. Recording, correcting or voiding a payment updates the
+parent debt's status in the same transaction, so a crash mid-write cannot leave a debt
+disagreeing with its payments.
+
+A correction deliberately cannot move a payment to a different customer or debt: that
+would change two balances at once under a single opaque edit. Void it and record it
+again, which leaves both actions in the audit trail.
+
+### Team
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/users` | any | List teammates, with last activity |
+| `POST` | `/api/users` | admin | Invite a teammate by email |
+| `GET` | `/api/users/{userId}` | any | Fetch one teammate |
+| `PATCH` | `/api/users/{userId}` | admin | Change a name or role |
+| `DELETE` | `/api/users/{userId}` | owner | Remove a teammate and end their sessions |
+
+**Invitations reuse password recovery.** The new account is created with a random
+password nobody holds, then a normal single-use reset link is emailed. The invitee
+chooses their own credential through the flow that already exists — no administrator
+ever picks somebody else's password, and there is no second token type to get wrong.
+The response never contains the link: it is a credential for taking over that account,
+so it goes to the invitee's inbox and nowhere else.
+
+Removal ends the member's refresh tokens in the same transaction that soft-deletes them.
+Their access token stays valid until it expires — at most `JWT_TTL`, 15 minutes by
+default — because a stateless token cannot be recalled. That ceiling is the reason the
+TTL is short.
+
+### Customer notes
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/customers/{customerId}/notes` | any | Follow-up history, newest first |
+| `POST` | `/api/customers/{customerId}/notes` | any | Record a note, call, SMS, email or visit |
+| `DELETE` | `/api/notes/{noteId}` | admin | Retract a note |
+
+The author's name is captured on the row at write time, so attribution survives that
+teammate later being removed.
+
+### Audit trail
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/audit-logs` | admin | Who did what, newest first |
+
+Filterable by `action`, `entityType`, `entityId` and `actorId`. Recorded actions cover
+every destructive and financial operation: customer deleted; debt updated, deleted or
+marked paid; payment created, corrected or voided; business profile changed; teammate
+invited, promoted or removed; password changed. Reads are never recorded — a trail that
+logs every `GET` is noise nobody reads, and it would turn the audit screen into a record
+of when colleagues were at their desks.
+
+The table is append-only by construction: no `updated_at`, no trigger, and no update or
+delete path in the repository.
+
+**Limitation.** Entries are written after the action commits, and a failure to write one
+is logged rather than failing the request — the action already happened, so failing the
+response would report a lie. A strictly transactional trail would mean threading the
+transaction through every mutating service; that is the upgrade path when a compliance
+requirement demands it.
+
+### Search
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| `GET` | `/api/search?q=` | any | Customers, debts and payments matching a term |
+
+Substring match across customer name, email, company and phone; debt description; and
+payment reference and notes. Debts and payments also match on their customer's name,
+which is what somebody typing a person's name into a search box actually wants. Terms
+shorter than two characters are rejected, and `%` and `_` in a term are escaped so they
+match literally rather than acting as wildcards.
 
 ### Query parameters
 
@@ -376,6 +454,10 @@ SQL, so an unknown or hostile value is rejected rather than interpolated.
 | `GET /api/customers` | `search` (name/contact substring), `riskLevel` |
 | `GET /api/debts` | `status`, `customerId`, `overdue=true` |
 | `GET /api/payments` | `customerId`, `debtId`, `method` |
+| `GET /api/users` | `role` |
+| `GET /api/customers/{id}/notes` | `channel` |
+| `GET /api/audit-logs` | `action`, `entityType`, `entityId`, `actorId` |
+| `GET /api/search` | `q` (required, 2+ characters), `limit` |
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -413,8 +495,8 @@ disable the selector rather than offer a change the API will reject.
 
 ## Rate limiting
 
-The unauthenticated endpoints are throttled. Exceeding a limit returns `429` with
-`Retry-After` in seconds.
+Every endpoint is throttled. Exceeding a limit returns `429` with `Retry-After` in
+seconds.
 
 | Endpoint | Limit | Keyed on |
 |---|---|---|
@@ -424,6 +506,18 @@ The unauthenticated endpoints are throttled. Exceeding a limit returns `429` wit
 | `POST /api/auth/forgot-password` | 20 / hour | IP |
 | `POST /api/auth/reset-password` | 10 / hour | IP |
 | `POST /api/auth/refresh` | 30 / minute | IP |
+| Any authenticated request | 300 / minute | user |
+| Authenticated `POST`/`PATCH`/`DELETE` | 60 / minute | user |
+| `POST /api/users` (invitations) | 20 / hour | business |
+
+**Authenticated traffic is keyed on the user, not the address.** Behind carrier-grade
+NAT an IP key would let one busy colleague throttle everybody in the office, and the user
+id is also what a stolen token impersonates — which is the thing worth capping. The
+numbers are a blast radius, not a business rule: somebody importing a customer list must
+never notice them. Reads and writes count separately, so a polling dashboard cannot
+exhaust the allowance that protects writes. Invitations are keyed on the business because
+the shared resource they consume is the sending domain's reputation, not one admin's
+quota.
 
 **Login is keyed on IP *and* email together.** Carrier-grade NAT is widespread on African
 mobile networks, so many unrelated subscribers share one public address — an IP-only
@@ -455,6 +549,24 @@ JSON and never HTML.
 
 Request bodies are capped at `MAX_REQUEST_BODY_BYTES`; anything larger gets `413`.
 
+Requests carrying a body must declare `Content-Type: application/json`; anything else
+gets `415`. Bearer authentication already makes this API immune to browser form CSRF —
+a cross-site form cannot set an `Authorization` header — and this keeps it that way: an
+endpoint that silently accepts `text/plain` is the shape that becomes exploitable the day
+somebody adds cookie authentication for convenience.
+
+Path parameters are validated as UUIDs before a handler runs. Without that check a
+request for `/api/customers/not-a-uuid` reached Postgres, which refused the cast, and the
+client's mistake was reported as a `500`. The check is mounted on the route subtree that
+owns the id, so every route beneath it inherits the guarantee.
+
+**Every** failure answers in the JSON envelope, including an unrouted path (`404`), a
+wrong method (`405`) and a panic (`500`). chi's defaults send plain text and empty bodies
+respectively, which breaks a client that parses every response as JSON. A panic response
+quotes the request id so a bug report can be matched to the logged stack; nothing about
+the panic itself is returned, since the value may name a table, a path, or another
+tenant's data.
+
 ## Testing
 
 Three tiers, all runnable locally:
@@ -466,7 +578,9 @@ make test-all          # everything
 ```
 
 Integration tests are guarded by the `integration` build tag and need a running Postgres;
-`make db-reset` gives them a clean `credflow_test` database. CI
+`make db-reset` gives them a clean `credflow_test` database. **They skip rather than fail
+when the database is unreachable**, so a green `make test-all` on a machine with no
+Docker means "nothing ran" — check the output for `SKIP` before trusting it. CI
 (`.github/workflows/test.yml`) runs build, vet, unit, and integration tests against a
 Postgres service container on every push.
 
@@ -478,10 +592,16 @@ Postgres service container on every push.
 cmd/server/          entrypoint — config, wiring, routes, graceful shutdown
 internal/
   auth/              register, login, JWT, password hashing, roles
+  users/             team management — invite, change role, remove
+  audit/             append-only trail of destructive and financial actions
   customers/         customer CRUD
+  notes/             customer follow-up history
   debts/             debt CRUD, mark-paid, derived balances
-  payments/          payment recording, idempotency, void
-  middleware/        RequireAuth, RequireRole
+  payments/          payment recording, idempotency, correction, void
+  search/            cross-entity lookup for the header search box
+  analytics/         dashboard and analytics aggregates
+  businesses/        business profile and onboarding
+  middleware/        auth, roles, CORS, rate limits, body/UUID/content-type guards
   testutil/          database helpers for tests
 pkg/
   database/          connection pool + migration runner

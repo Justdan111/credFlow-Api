@@ -7,16 +7,24 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Justdan111/credflow-api/internal/audit"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
 type Handler struct {
-	svc *Service
+	svc      *Service
+	recorder Recorder
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+// Recorder writes the audit trail. Declared as an interface here so this
+// package does not depend on how the audit service is constructed.
+type Recorder interface {
+	Record(r *http.Request, action, entityType string, entityID *string, metadata map[string]any)
+}
+
+func NewHandler(svc *Service, recorder Recorder) *Handler {
+	return &Handler{svc: svc, recorder: recorder}
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -84,10 +92,22 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	id := chi.URLParam(r, "customerId")
 
+	// Read first: once deleted the row is filtered out of every query, and an
+	// audit entry that cannot name who was removed is of little use.
+	deleted, err := h.svc.Get(r.Context(), businessID, id)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
 	if err := h.svc.Delete(r.Context(), businessID, id); err != nil {
 		writeServiceError(w, err)
 		return
 	}
+
+	h.recorder.Record(r, audit.ActionCustomerDeleted, audit.EntityCustomer, &id,
+		map[string]any{"name": deleted.Name, "riskLevel": deleted.RiskLevel})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 

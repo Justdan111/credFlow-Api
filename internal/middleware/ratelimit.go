@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/pkg/ratelimit"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
@@ -77,6 +78,46 @@ func ByIPAndEmail(r *http.Request) string {
 		return "ip:" + ClientIP(r)
 	}
 	return "ip+email:" + ClientIP(r) + "|" + email
+}
+
+// ByUser keys on the authenticated user id, falling back to IP when no token
+// has been verified yet.
+//
+// User rather than IP for the same reason login keys on IP + email: carrier-
+// grade NAT is widespread on African mobile networks, so an IP-keyed limit on
+// authenticated traffic would let one busy colleague throttle everybody sharing
+// the office connection. The user id is also the thing worth capping — it is
+// what a stolen token impersonates.
+//
+// Must be chained AFTER RequireAuth, which is what puts the id in context.
+func ByUser(r *http.Request) string {
+	if userID, ok := auth.UserIDFromContext(r.Context()); ok {
+		return "user:" + userID
+	}
+	return "ip:" + ClientIP(r)
+}
+
+// ByBusiness keys on the tenant, for limits that protect a shared resource
+// rather than one person — invitations, which send mail on somebody's behalf.
+func ByBusiness(r *http.Request) string {
+	if businessID, ok := auth.BusinessIDFromContext(r.Context()); ok {
+		return "business:" + businessID
+	}
+	return "ip:" + ClientIP(r)
+}
+
+// ByMutatingMethod applies a rule only to requests that change state, so reads
+// and writes can carry different ceilings on the same route group.
+func ByMutatingMethod(key func(*http.Request) string) func(*http.Request) string {
+	return func(r *http.Request) string {
+		switch r.Method {
+		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+			return key(r)
+		default:
+			// An empty key skips the rule entirely.
+			return ""
+		}
+	}
 }
 
 func extractEmail(r *http.Request) string {

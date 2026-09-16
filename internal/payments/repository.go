@@ -195,6 +195,43 @@ func (r *Repository) Get(ctx context.Context, businessID, id string) (Payment, e
 	return p, err
 }
 
+// Update applies a correction. Every column uses COALESCE against a nullable
+// parameter, so an omitted field keeps its current value in one statement — no
+// read-modify-write, and therefore no window in which a concurrent change is
+// silently overwritten.
+func (r *Repository) Update(
+	ctx context.Context, db DBTX, businessID, id string, req UpdateRequest, paidAt *time.Time,
+) (Payment, error) {
+	q := `
+		UPDATE payments SET
+			amount    = COALESCE($3, amount),
+			method    = COALESCE($4, method),
+			reference = CASE WHEN $5::boolean THEN NULLIF($6, '') ELSE reference END,
+			notes     = CASE WHEN $7::boolean THEN NULLIF($8, '') ELSE notes END,
+			paid_at   = COALESCE($9, paid_at)
+		WHERE business_id = $1 AND id = $2 AND deleted_at IS NULL
+		RETURNING ` + paymentSelect
+
+	// The boolean flags say "this key was present", so an explicit empty string
+	// clears the field while an omitted key leaves it alone — the same shape
+	// auth.UpdateProfile uses for phone.
+	refPresent, refValue := req.Reference != nil, ""
+	if req.Reference != nil {
+		refValue = *req.Reference
+	}
+	notesPresent, notesValue := req.Notes != nil, ""
+	if req.Notes != nil {
+		notesValue = *req.Notes
+	}
+
+	p, err := scanPayment(db.QueryRow(ctx, q, businessID, id,
+		req.Amount, req.Method, refPresent, refValue, notesPresent, notesValue, paidAt))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Payment{}, ErrNotFound
+	}
+	return p, err
+}
+
 // SoftDelete returns the payment's debt_id (if any) so the service can
 // recompute the debt's status in the same transaction.
 func (r *Repository) SoftDelete(ctx context.Context, db DBTX, businessID, id string) (debtID *string, err error) {

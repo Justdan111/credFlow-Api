@@ -22,13 +22,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Justdan111/credflow-api/internal/analytics"
+	"github.com/Justdan111/credflow-api/internal/audit"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/internal/businesses"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
+	"github.com/Justdan111/credflow-api/internal/notes"
 	"github.com/Justdan111/credflow-api/internal/payments"
+	"github.com/Justdan111/credflow-api/internal/search"
 	"github.com/Justdan111/credflow-api/internal/testutil"
+	"github.com/Justdan111/credflow-api/internal/users"
 	"github.com/Justdan111/credflow-api/pkg/ratelimit"
 )
 
@@ -45,7 +49,9 @@ var testAllowedOrigins = []string{"http://localhost:5173"}
 func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewTestDB(t)
-	testutil.Truncate(t, pool, "password_reset_tokens", "customer_risk_snapshots", "refresh_tokens", "payments", "debts", "customers", "users", "businesses")
+	testutil.Truncate(t, pool, "audit_logs", "customer_notes", "password_reset_tokens",
+		"customer_risk_snapshots", "refresh_tokens", "payments", "debts", "customers",
+		"users", "businesses")
 
 	jwtSvc := auth.NewJWTService("integration-test-secret", time.Hour)
 
@@ -55,30 +61,44 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 		testMailer, "http://localhost:5173", time.Hour)
 	// Secure:false — httptest serves plain http, so a Secure cookie would
 	// never be stored by the client.
-	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL)
+	userRepo := users.NewRepository(pool)
+	auditSvc := audit.NewService(audit.NewRepository(pool), userRepo)
+	auditHandler := audit.NewHandler(auditSvc)
+	userHandler := users.NewHandler(
+		users.NewService(pool, userRepo, authSvc, auth.NewRepository()), auditSvc)
+
+	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: false}, testRefreshTTL, auditSvc)
 
 	customerSvc := customers.NewService(customers.NewRepository(pool))
 	debtSvcForBiz := debts.NewService(debts.NewRepository(pool))
 	businessHandler := businesses.NewHandler(businesses.NewService(pool,
-		businesses.NewRepository(pool), customerSvc, debtSvcForBiz))
+		businesses.NewRepository(pool), customerSvc, debtSvcForBiz), auditSvc)
 
 	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
 	analyticsHandler := analytics.NewHandler(analyticsSvc)
 
-	customerHandler := customers.NewHandler(customers.NewService(customers.NewRepository(pool)))
+	customerHandler := customers.NewHandler(customers.NewService(customers.NewRepository(pool)), auditSvc)
 	debtRepo := debts.NewRepository(pool)
-	debtHandler := debts.NewHandler(debts.NewService(debtRepo))
-	paymentHandler := payments.NewHandler(payments.NewService(payments.NewRepository(pool)), debtRepo)
+	debtHandler := debts.NewHandler(debts.NewService(debtRepo), auditSvc)
+	paymentHandler := payments.NewHandler(payments.NewService(payments.NewRepository(pool)), debtRepo, auditSvc)
+
+	noteHandler := notes.NewHandler(notes.NewService(notes.NewRepository(pool)), userRepo)
+	searchHandler := search.NewHandler(search.NewService(search.NewRepository(pool)))
 
 	r := chi.NewRouter()
 	r.Use(appmiddleware.SecurityHeaders(true))
 	r.Use(appmiddleware.BodyLimit(testMaxBodyBytes))
-	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.RequestID)
+	r.Use(appmiddleware.Recoverer)
+	r.Use(appmiddleware.RequireJSON)
+	r.NotFound(appmiddleware.NotFound)
+	r.MethodNotAllowed(appmiddleware.MethodNotAllowed)
 	// chimiddleware.RealIP is deliberately NOT mounted, mirroring the default
 	// TRUST_PROXY_HEADERS=false: RemoteAddr stays the true peer so a forged
 	// X-Forwarded-For cannot reset a rate limit.
 
 	originCheck := appmiddleware.RequireAllowedOrigin(testAllowedOrigins)
+	limitAuthed := testLimitAuthenticated(limiter)
 
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", authHandler.Register)
@@ -93,31 +113,53 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 			r.Patch("/me", authHandler.UpdateMe)
 			r.With(originCheck).Post("/change-password", authHandler.ChangePassword)
 			r.Get("/sessions", authHandler.ListSessions)
-			r.With(originCheck).Delete("/sessions/{sessionId}", authHandler.RevokeSession)
+			r.With(originCheck, appmiddleware.ValidateUUIDParams("sessionId")).
+				Delete("/sessions/{sessionId}", authHandler.RevokeSession)
 		})
 	})
 	ownerAdmin := appmiddleware.RequireRole(auth.RoleOwner, auth.RoleAdmin)
 	ownerOnly := appmiddleware.RequireRole(auth.RoleOwner)
 
+	// The nesting below mirrors cmd/server/main.go exactly. It is not cosmetic:
+	// chi only populates URL parameters once the pattern carrying them has
+	// matched, so ValidateUUIDParams has to sit on the subtree that owns the id.
 	r.Route("/api/customers", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthed)
 		r.Get("/", customerHandler.List)
 		r.Post("/", customerHandler.Create)
-		r.Get("/{customerId}", customerHandler.Get)
-		r.Patch("/{customerId}", customerHandler.Update)
-		r.With(ownerAdmin).Delete("/{customerId}", customerHandler.Delete)
-		r.Get("/{customerId}/debts", debtHandler.ListByCustomer)
-		r.Get("/{customerId}/payments", paymentHandler.ListByCustomer)
+		r.Route("/{customerId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("customerId"))
+			r.Get("/", customerHandler.Get)
+			r.Patch("/", customerHandler.Update)
+			r.With(ownerAdmin).Delete("/", customerHandler.Delete)
+			r.Get("/debts", debtHandler.ListByCustomer)
+			r.Get("/payments", paymentHandler.ListByCustomer)
+			r.Get("/notes", noteHandler.List)
+			r.Post("/notes", noteHandler.Create)
+		})
+	})
+	r.Route("/api/notes", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Route("/{noteId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("noteId"))
+			r.With(ownerAdmin).Delete("/", noteHandler.Delete)
+		})
 	})
 	r.Route("/api/debts", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthed)
 		r.Get("/", debtHandler.List)
 		r.Post("/", debtHandler.Create)
-		r.Get("/{debtId}", debtHandler.Get)
-		r.With(ownerAdmin).Patch("/{debtId}", debtHandler.Update)
-		r.With(ownerAdmin).Delete("/{debtId}", debtHandler.Delete)
-		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
-		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
+		r.Route("/{debtId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("debtId"))
+			r.Get("/", debtHandler.Get)
+			r.With(ownerAdmin).Patch("/", debtHandler.Update)
+			r.With(ownerAdmin).Delete("/", debtHandler.Delete)
+			r.Post("/mark-paid", debtHandler.MarkPaid)
+			r.Post("/payments", paymentHandler.CreateForDebt)
+			r.Get("/payments", paymentHandler.ListByDebt)
+		})
 	})
 	r.Route("/api/businesses", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
@@ -148,10 +190,37 @@ func newTestServer(t *testing.T) (string, *pgxpool.Pool) {
 
 	r.Route("/api/payments", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthed)
 		r.Get("/", paymentHandler.List)
 		r.Post("/", paymentHandler.Create)
-		r.Get("/{paymentId}", paymentHandler.Get)
-		r.With(ownerOnly).Delete("/{paymentId}", paymentHandler.Delete)
+		r.Route("/{paymentId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("paymentId"))
+			r.Get("/", paymentHandler.Get)
+			r.With(ownerAdmin).Patch("/", paymentHandler.Update)
+			r.With(ownerOnly).Delete("/", paymentHandler.Delete)
+		})
+	})
+
+	r.Route("/api/users", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/", userHandler.List)
+		r.With(ownerAdmin, originCheck).Post("/", userHandler.Invite)
+		r.Route("/{userId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("userId"))
+			r.Get("/", userHandler.Get)
+			r.With(ownerAdmin, originCheck).Patch("/", userHandler.Update)
+			r.With(ownerOnly, originCheck).Delete("/", userHandler.Remove)
+		})
+	})
+
+	r.Route("/api/audit-logs", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.With(ownerAdmin).Get("/", auditHandler.List)
+	})
+
+	r.Route("/api/search", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Get("/", searchHandler.Search)
 	})
 
 	srv := httptest.NewServer(r)
@@ -247,12 +316,22 @@ type recordingMailer struct {
 
 type sentMail struct {
 	To, Name, URL string
+	// Inviter is set only for invitations, so a test can tell the two kinds of
+	// mail apart without a second recorder.
+	Inviter string
 }
 
 func (m *recordingMailer) SendPasswordReset(_ context.Context, to, name, url string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sent = append(m.sent, sentMail{To: to, Name: name, URL: url})
+	return nil
+}
+
+func (m *recordingMailer) SendInvitation(_ context.Context, to, name, inviterName, url string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, sentMail{To: to, Name: name, URL: url, Inviter: inviterName})
 	return nil
 }
 
@@ -282,12 +361,26 @@ const (
 	testMaxBodyBytes = 4096
 	testLoginLimit   = 20
 	testForgotLimit  = 2
+	// Small enough for a test to reach in a reasonable number of requests, but
+	// comfortably above what any single test legitimately writes — a limit that
+	// trips during unrelated setup tests the limiter rather than the feature.
+	// Applied only to writes, so the many reads other tests perform stay clear
+	// of it. Production values live in cmd/server/main.go.
+	testAuthedWriteLimit = 25
 )
 
 func testLimitLogin(l ratelimit.Limiter) func(http.Handler) http.Handler {
 	return appmiddleware.RateLimit(l, appmiddleware.RateLimitRule{
 		Name: "login", Limit: testLoginLimit, Window: time.Minute,
 		KeyFunc: appmiddleware.ByIPAndEmail,
+	})
+}
+
+// testLimitAuthenticated mirrors the production per-user write ceiling.
+func testLimitAuthenticated(l ratelimit.Limiter) func(http.Handler) http.Handler {
+	return appmiddleware.RateLimit(l, appmiddleware.RateLimitRule{
+		Name: "authed-write", Limit: testAuthedWriteLimit, Window: time.Minute,
+		KeyFunc: appmiddleware.ByMutatingMethod(appmiddleware.ByUser),
 	})
 }
 
