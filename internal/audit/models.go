@@ -2,12 +2,8 @@ package audit
 
 import "time"
 
-// Action names. Dotted "<entity>.<verb>", so a client can filter by prefix and
-// a reader can scan the column without a legend.
-//
-// Constants rather than free strings: a typo in an audit action is invisible
-// until somebody investigates an incident and the entry they need is filed
-// under "payement.voided".
+// Action names, dotted "<entity>.<verb>". Constants rather than free strings: a
+// typo stays invisible until somebody needs the entry it misfiled.
 const (
 	ActionCustomerDeleted = "customer.deleted"
 
@@ -41,8 +37,7 @@ type Entry struct {
 	ID         string `json:"id"`
 	BusinessID string `json:"businessId"`
 
-	// ActorID is null once that user is removed; the denormalised email and
-	// name keep the entry readable regardless.
+	// Null once that user is removed; the denormalised name and email remain.
 	ActorID    *string `json:"actorId"`
 	ActorEmail string  `json:"actorEmail"`
 	ActorName  string  `json:"actorName"`
@@ -51,17 +46,14 @@ type Entry struct {
 	EntityType string  `json:"entityType"`
 	EntityID   *string `json:"entityId"`
 
-	// Metadata carries whatever makes the entry meaningful a year later: the
-	// amount voided, the role somebody was promoted to.
+	// Whatever makes the entry meaningful later: an amount, a granted role.
 	Metadata map[string]any `json:"metadata"`
 
 	IP        *string   `json:"ip"`
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-// ListQuery filters the trail. Deliberately narrow: an audit screen is read
-// chronologically, and the two useful cuts are "what did this action do" and
-// "what happened to this row".
+// ListQuery filters the trail.
 type ListQuery struct {
 	Page       int
 	PageSize   int

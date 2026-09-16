@@ -30,11 +30,8 @@ type DBTX interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// memberColumns joins the newest refresh token per user to derive last activity.
-//
-// A LATERAL subquery rather than a GROUP BY over the whole join: it stops at the
-// first row per user using the existing index, instead of aggregating every
-// token a long-lived account has ever held.
+// Joins the newest refresh token per user to derive last activity. LATERAL
+// rather than GROUP BY: it stops at the first row per user using the index.
 const memberSelect = `
 	SELECT u.id, u.business_id, u.email, u.name, COALESCE(u.phone, ''), u.role,
 	       u.invited_by, last_session.created_at,
@@ -142,8 +139,7 @@ func (r *Repository) Update(ctx context.Context, businessID, userID string, name
 	if err != nil {
 		return Member{}, err
 	}
-	// Re-read through the list projection so the response carries last activity
-	// rather than a second, thinner shape of the same resource.
+	// Re-read through the list projection so the response carries last activity.
 	return r.Get(ctx, businessID, userID)
 }
 
@@ -174,8 +170,7 @@ func (r *Repository) CountByRole(ctx context.Context, db DBTX, businessID, role 
 	return n, err
 }
 
-// ActorByID resolves the identity denormalised onto an audit entry. It ignores
-// deleted_at: an entry written by someone since removed must still name them.
+// ActorByID ignores deleted_at: an audit entry must still name a removed user.
 func (r *Repository) ActorByID(ctx context.Context, userID string) (string, string, error) {
 	const q = `SELECT email, name FROM users WHERE id = $1`
 	var email, name string

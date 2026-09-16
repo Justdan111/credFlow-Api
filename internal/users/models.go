@@ -2,22 +2,17 @@ package users
 
 import "time"
 
-// Member is one person on a business's team.
-//
-// No password hash, ever: this type is serialised straight to the client, and
-// a field that must never be exposed is best not present on the struct that
-// gets marshalled.
+// Member is one person on a business's team. It deliberately carries no
+// password hash: this type is serialised straight to the client.
 type Member struct {
-	ID         string     `json:"id"`
-	BusinessID string     `json:"businessId"`
-	Email      string     `json:"email"`
-	Name       string     `json:"name"`
-	Phone      string     `json:"phone"`
-	Role       string     `json:"role"`
-	InvitedBy  *string    `json:"invitedBy"`
-	// LastActiveAt is null for someone who has never signed in — which is how
-	// the UI can show an invitation as still outstanding without a separate
-	// invitations table to keep in sync.
+	ID         string  `json:"id"`
+	BusinessID string  `json:"businessId"`
+	Email      string  `json:"email"`
+	Name       string  `json:"name"`
+	Phone      string  `json:"phone"`
+	Role       string  `json:"role"`
+	InvitedBy  *string `json:"invitedBy"`
+	// Null until they first sign in, which is how a pending invite is detected.
 	LastActiveAt *time.Time `json:"lastActiveAt"`
 	CreatedAt    time.Time  `json:"createdAt"`
 	UpdatedAt    time.Time  `json:"updatedAt"`
@@ -29,19 +24,14 @@ type InviteRequest struct {
 	Role  string `json:"role"`
 }
 
-// InviteResponse returns the created member.
-//
-// It deliberately carries no token or link. The invitation is a credential for
-// taking over an account, so it goes to the invitee's inbox and nowhere else —
-// returning it here would let anyone who can invite also read the link and
-// claim the account themselves.
+// InviteResponse carries no token or link: the invitation is a credential for
+// taking over an account, so it goes only to the invitee's inbox.
 type InviteResponse struct {
 	Member Member `json:"member"`
 }
 
-// UpdateRequest uses pointers so an omitted key is left unchanged.
-// Email is absent for the same reason it is absent from PATCH /auth/me: a login
-// identifier needs its own verification flow.
+// UpdateRequest uses pointers so an omitted key is left unchanged. Email is
+// absent: a login identifier needs its own verification flow.
 type UpdateRequest struct {
 	Name *string `json:"name,omitempty"`
 	Role *string `json:"role,omitempty"`

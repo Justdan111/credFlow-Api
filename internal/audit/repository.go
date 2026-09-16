@@ -8,11 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Repository is append-and-read only.
-//
-// There is deliberately no Update and no Delete. An audit trail that can be
-// edited by the same application that writes it is not evidence of anything,
-// and the cheapest way to guarantee that is to never write the code.
+// Repository is append-and-read only: no Update, no Delete. A trail the
+// application can edit is not evidence of anything.
 type Repository struct {
 	db *pgxpool.Pool
 }
@@ -54,9 +51,7 @@ func (r *Repository) Insert(ctx context.Context, e Entry) error {
 }
 
 func (r *Repository) List(ctx context.Context, businessID string, q ListQuery) ([]Entry, int, error) {
-	// Filters are appended positionally. Every value is a bind parameter and no
-	// caller input reaches the SQL text, so the WHERE clause cannot be steered
-	// by a request.
+	// Every value is a bind parameter; no caller input reaches the SQL text.
 	where := " WHERE business_id = $1"
 	args := []any{businessID}
 
@@ -82,9 +77,7 @@ func (r *Repository) List(ctx context.Context, businessID string, q ListQuery) (
 		return nil, 0, fmt.Errorf("count audit logs: %w", err)
 	}
 
-	// Newest first, with id as a tiebreaker: two entries written in the same
-	// transaction share a timestamp, and an unstable order would make them
-	// swap places between pages and hide one.
+	// id breaks ties: entries sharing a timestamp would otherwise swap pages.
 	listSQL := `SELECT ` + entryColumns + ` FROM audit_logs` + where +
 		fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 	args = append(args, q.PageSize, (q.Page-1)*q.PageSize)

@@ -10,32 +10,23 @@ import (
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
-// NotFound answers an unrouted path in the standard envelope.
-//
-// chi's default writes the plain text "404 page not found", which breaks a
-// client that parses every response as JSON — it sees a syntax error instead of
-// the reason its request failed. The whole point of a single envelope is that
-// there is exactly one shape to handle.
+// NotFound answers an unrouted path in the standard envelope. chi's default
+// writes plain text, which breaks a client that parses every response as JSON.
 func NotFound(w http.ResponseWriter, _ *http.Request) {
 	response.Fail(w, http.StatusNotFound, "no route matches this path")
 }
 
 // MethodNotAllowed answers a known path with the wrong verb. chi's default
-// sends an empty body, which tells a client nothing at all.
+// sends an empty body.
 func MethodNotAllowed(w http.ResponseWriter, _ *http.Request) {
 	response.Fail(w, http.StatusMethodNotAllowed, "this method is not allowed on this path")
 }
 
-// Recoverer turns a panic into a 500 in the envelope.
+// Recoverer turns a panic into a 500 in the envelope, logging the stack and
+// returning the request id so a bug report can be matched to it.
 //
-// chi's Recoverer stops the process from dying but writes a bare status with no
-// body, so a panic is indistinguishable from a network failure at the client.
-// This one logs the stack for the operator and returns the request id to the
-// caller, which is the only way somebody reporting "it broke" can be matched to
-// the trace that explains why.
-//
-// Nothing about the panic itself reaches the client: the message may contain a
-// query fragment, a file path, or data from another tenant.
+// Nothing about the panic itself reaches the client: the value may contain a
+// query fragment, a file path, or another tenant's data.
 func Recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -43,8 +34,7 @@ func Recoverer(next http.Handler) http.Handler {
 			if rec == nil {
 				return
 			}
-			// A client that hung up mid-response is not a server fault, and the
-			// connection is already gone — there is nothing to write to.
+			// The client hung up; there is nothing left to write to.
 			if rec == http.ErrAbortHandler {
 				panic(rec)
 			}

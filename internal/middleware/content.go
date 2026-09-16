@@ -9,16 +9,12 @@ import (
 
 // RequireJSON rejects a request that carries a body without declaring JSON.
 //
-// Bearer authentication already makes this API immune to browser form CSRF: a
-// cross-site form cannot set an Authorization header. The value here is keeping
-// it that way. An endpoint that quietly accepts text/plain is exactly the shape
-// that becomes exploitable the day somebody adds cookie authentication for
-// convenience, because a plain HTML form can post text/plain but never
+// Bearer auth already rules out browser form CSRF; this keeps it that way. An
+// endpoint that quietly accepts text/plain is what becomes exploitable the day
+// somebody adds cookie auth, since a form can post text/plain but never
 // application/json.
 //
-// GET, HEAD, DELETE and OPTIONS carry no body and are exempt. A body-less POST
-// is allowed through too — POST /debts/{id}/mark-paid takes no payload, and
-// demanding a content type for an empty body would be pedantry.
+// Body-less verbs are exempt, as is a POST with no body — mark-paid takes none.
 func RequireJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -29,14 +25,12 @@ func RequireJSON(next http.Handler) http.Handler {
 
 		header := r.Header.Get("Content-Type")
 		if header == "" {
-			// No body declared. Handlers that need one answer "invalid json
-			// body" on their own, which is the more useful message.
+			// Handlers answer "invalid json body" themselves, which says more.
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// ParseMediaType strips parameters, so "application/json; charset=utf-8"
-		// is accepted — a common and entirely valid spelling.
+		// Strips parameters, so "application/json; charset=utf-8" is accepted.
 		mediaType, _, err := mime.ParseMediaType(header)
 		if err != nil || mediaType != "application/json" {
 			response.Fail(w, http.StatusUnsupportedMediaType,

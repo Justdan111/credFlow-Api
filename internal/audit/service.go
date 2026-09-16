@@ -1,9 +1,6 @@
 // Package audit records who performed the destructive and financial actions
-// this API exposes, and serves that trail back.
-//
-// The README states that deleting a customer needs admin and voiding a payment
-// needs owner. Enforcing that without recording it answers "could they?" but
-// never "did they?" — which is the question asked after money goes missing.
+// this API exposes, and serves that trail back. Enforcing a role answers
+// "could they?"; the trail answers "did they?".
 package audit
 
 import (
@@ -22,9 +19,7 @@ const (
 
 type Service struct {
 	repo *Repository
-	// Resolving the actor's email and name needs a users lookup. The interface
-	// is declared here, in the consumer, so this package does not import a
-	// feature package and create a cycle.
+	// Declared in the consumer so this package imports no feature package.
 	actors ActorLookup
 }
 
@@ -39,13 +34,10 @@ func NewService(repo *Repository, actors ActorLookup) *Service {
 
 // Record writes one entry for the caller identified by the request.
 //
-// LIMITATION: the entry is written after the action has already committed, and
-// a failure here is logged rather than returned. The alternative — failing the
-// response — would tell the caller their delete did not happen when it did,
-// which is a worse lie than a missing log line. A strictly transactional trail
-// means threading the transaction through every mutating service; worth doing
-// when a compliance requirement demands it, noted here rather than pretended
-// away.
+// LIMITATION: the entry is written after the action commits, and a failure is
+// logged rather than returned — failing the response would tell the caller their
+// delete did not happen when it did. A transactional trail would mean threading
+// the transaction through every mutating service.
 func (s *Service) Record(r *http.Request, action, entityType string, entityID *string, metadata map[string]any) {
 	ctx := r.Context()
 
@@ -78,9 +70,8 @@ func (s *Service) Record(r *http.Request, action, entityType string, entityID *s
 		IP:         &ip,
 	}
 
-	// The request context is cancelled the moment the response is written, and
-	// this runs at the very end of a handler. Using it would routinely abort
-	// the insert, so the write gets its own background context.
+	// The request context is cancelled once the response is written, so the
+	// insert gets its own.
 	if err := s.repo.Insert(context.WithoutCancel(ctx), entry); err != nil {
 		log.Printf("audit: record %s for business %s failed: %v", action, businessID, err)
 	}
