@@ -18,12 +18,16 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/Justdan111/credflow-api/internal/analytics"
+	"github.com/Justdan111/credflow-api/internal/audit"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/internal/businesses"
 	"github.com/Justdan111/credflow-api/internal/customers"
 	"github.com/Justdan111/credflow-api/internal/debts"
 	appmiddleware "github.com/Justdan111/credflow-api/internal/middleware"
+	"github.com/Justdan111/credflow-api/internal/notes"
 	"github.com/Justdan111/credflow-api/internal/payments"
+	"github.com/Justdan111/credflow-api/internal/search"
+	"github.com/Justdan111/credflow-api/internal/users"
 	"github.com/Justdan111/credflow-api/pkg/database"
 	"github.com/Justdan111/credflow-api/pkg/mailer"
 	"github.com/Justdan111/credflow-api/pkg/ratelimit"
@@ -88,26 +92,41 @@ func main() {
 	mail := mailer.NewConsoleMailer()
 	authSvc := auth.NewService(pool, authRepo, jwtSvc, refreshTTL, refreshAbsoluteTTL,
 		mail, appBaseURL, resetTTL)
-	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: cookieSecure}, refreshTTL)
+	// The team and audit packages are constructed first: every handler that
+	// mutates something takes the recorder, so it has to exist before them.
+	//
+	// users.Service satisfies audit.ActorLookup, and auth.Service satisfies
+	// users.Inviter — each interface is declared by its consumer, so the
+	// dependencies point one way and no package imports the other back.
+	userRepo := users.NewRepository(pool)
+	auditSvc := audit.NewService(audit.NewRepository(pool), userRepo)
+	auditHandler := audit.NewHandler(auditSvc)
+	userSvc := users.NewService(pool, userRepo, authSvc, authRepo)
+	userHandler := users.NewHandler(userSvc, auditSvc)
+
+	authHandler := auth.NewHandler(authSvc, auth.CookieConfig{Secure: cookieSecure}, refreshTTL, auditSvc)
 
 	customerRepo := customers.NewRepository(pool)
 	customerSvc := customers.NewService(customerRepo)
-	customerHandler := customers.NewHandler(customerSvc)
+	customerHandler := customers.NewHandler(customerSvc, auditSvc)
 
 	debtRepo := debts.NewRepository(pool)
 	debtSvc := debts.NewService(debtRepo)
-	debtHandler := debts.NewHandler(debtSvc)
+	debtHandler := debts.NewHandler(debtSvc, auditSvc)
 
 	businessSvc := businesses.NewService(pool, businesses.NewRepository(pool),
 		customerSvc, debtSvc)
-	businessHandler := businesses.NewHandler(businessSvc)
+	businessHandler := businesses.NewHandler(businessSvc, auditSvc)
 
 	analyticsSvc := analytics.NewService(analytics.NewRepository(pool))
 	analyticsHandler := analytics.NewHandler(analyticsSvc)
 
 	paymentRepo := payments.NewRepository(pool)
 	paymentSvc := payments.NewService(paymentRepo)
-	paymentHandler := payments.NewHandler(paymentSvc, debtRepo)
+	paymentHandler := payments.NewHandler(paymentSvc, debtRepo, auditSvc)
+
+	noteHandler := notes.NewHandler(notes.NewService(notes.NewRepository(pool)), userRepo)
+	searchHandler := search.NewHandler(search.NewService(search.NewRepository(pool)))
 
 	app := &App{DB: pool, JWT: jwtSvc, Auth: authSvc}
 
@@ -128,8 +147,19 @@ func main() {
 		r.Use(chimiddleware.RealIP)
 	}
 	r.Use(chimiddleware.Logger)
-	r.Use(chimiddleware.Recoverer)
+	// Our own Recoverer, not chi's: chi writes a bare status with no body, so a
+	// panic is indistinguishable from a dropped connection at the client. This
+	// one answers in the envelope and quotes the request id.
+	r.Use(appmiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(60 * time.Second))
+	// Writes must declare JSON. See internal/middleware/content.go for why this
+	// matters even though bearer auth already rules out browser form CSRF.
+	r.Use(appmiddleware.RequireJSON)
+
+	// chi's defaults answer these in plain text and an empty body respectively,
+	// which breaks any client that parses every response as JSON.
+	r.NotFound(appmiddleware.NotFound)
+	r.MethodNotAllowed(appmiddleware.MethodNotAllowed)
 
 	r.Get("/health", app.handleHealth)
 	r.Get("/health/db", app.handleHealthDB)
@@ -174,6 +204,33 @@ func main() {
 		Name: "refresh", Limit: 30, Window: time.Minute, KeyFunc: appmiddleware.ByIP,
 	})
 
+	// Authenticated traffic. Phase 12 throttled only the unauthenticated edge,
+	// so a stolen token had no ceiling at all — 60 rapid writes in a row all
+	// returned 201.
+	//
+	// Keyed on the user, not the IP: behind carrier-grade NAT an IP key would
+	// let one busy colleague throttle the whole office. The user id is also what
+	// a stolen token impersonates, which is the thing worth capping.
+	//
+	// The numbers are a blast radius, not a business rule. Somebody importing a
+	// customer list must never notice them.
+	limitAuthenticated := appmiddleware.RateLimit(limiter,
+		appmiddleware.RateLimitRule{
+			Name: "authed-read", Limit: 300, Window: time.Minute,
+			KeyFunc: appmiddleware.ByUser,
+		},
+		appmiddleware.RateLimitRule{
+			Name: "authed-write", Limit: 60, Window: time.Minute,
+			KeyFunc: appmiddleware.ByMutatingMethod(appmiddleware.ByUser),
+		},
+	)
+	// Invitations send mail on somebody else's behalf, so this one is keyed on
+	// the business: the shared resource being protected is the sending domain's
+	// reputation, not any one admin's quota.
+	limitInvite := appmiddleware.RateLimit(limiter, appmiddleware.RateLimitRule{
+		Name: "invite", Limit: 20, Window: time.Hour, KeyFunc: appmiddleware.ByBusiness,
+	})
+
 	r.Route("/api/auth", func(r chi.Router) {
 		r.With(limitRegister).Post("/register", authHandler.Register)
 		r.With(limitLogin).Post("/login", authHandler.Login)
@@ -189,11 +246,13 @@ func main() {
 
 		r.Group(func(r chi.Router) {
 			r.Use(appmiddleware.RequireAuth(jwtSvc))
+			r.Use(limitAuthenticated)
 			r.Get("/me", authHandler.Me)
 			r.Patch("/me", authHandler.UpdateMe)
 			r.With(originCheck).Post("/change-password", authHandler.ChangePassword)
 			r.Get("/sessions", authHandler.ListSessions)
-			r.With(originCheck).Delete("/sessions/{sessionId}", authHandler.RevokeSession)
+			r.With(originCheck, appmiddleware.ValidateUUIDParams("sessionId")).
+				Delete("/sessions/{sessionId}", authHandler.RevokeSession)
 		})
 	})
 
@@ -202,30 +261,63 @@ func main() {
 
 	r.Route("/api/customers", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/", customerHandler.List)
 		r.Post("/", customerHandler.Create)
-		r.Get("/{customerId}", customerHandler.Get)
-		r.Patch("/{customerId}", customerHandler.Update)
-		r.With(ownerAdmin).Delete("/{customerId}", customerHandler.Delete)
-		r.Get("/{customerId}/debts", debtHandler.ListByCustomer)
-		r.Get("/{customerId}/payments", paymentHandler.ListByCustomer)
+
+		// Everything addressed by id lives under one subtree so the UUID check
+		// is structural: a route added here inherits it and cannot forget it.
+		// chi only fills URL parameters once the pattern carrying them has been
+		// matched, so this has to be a nested Route — mounting the middleware on
+		// the parent group would see an empty value and validate nothing.
+		r.Route("/{customerId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("customerId"))
+			r.Get("/", customerHandler.Get)
+			r.Patch("/", customerHandler.Update)
+			r.With(ownerAdmin).Delete("/", customerHandler.Delete)
+			r.Get("/debts", debtHandler.ListByCustomer)
+			r.Get("/payments", paymentHandler.ListByCustomer)
+			r.Get("/notes", noteHandler.List)
+			r.Post("/notes", noteHandler.Create)
+		})
+	})
+
+	// Notes are deleted by their own id, which no customer path carries.
+	r.Route("/api/notes", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
+		r.Route("/{noteId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("noteId"))
+			// Retracting somebody else's record of a conversation is administrative.
+			r.With(ownerAdmin).Delete("/", noteHandler.Delete)
+		})
 	})
 
 	r.Route("/api/debts", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/", debtHandler.List)
 		r.Post("/", debtHandler.Create)
-		r.Get("/{debtId}", debtHandler.Get)
-		r.With(ownerAdmin).Patch("/{debtId}", debtHandler.Update)
-		r.With(ownerAdmin).Delete("/{debtId}", debtHandler.Delete)
-		r.Post("/{debtId}/mark-paid", debtHandler.MarkPaid)
-		r.Post("/{debtId}/payments", paymentHandler.CreateForDebt)
+
+		r.Route("/{debtId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("debtId"))
+			r.Get("/", debtHandler.Get)
+			r.With(ownerAdmin).Patch("/", debtHandler.Update)
+			r.With(ownerAdmin).Delete("/", debtHandler.Delete)
+			r.Post("/mark-paid", debtHandler.MarkPaid)
+			r.Post("/payments", paymentHandler.CreateForDebt)
+			// Documented since the first endpoint catalogue but never
+			// registered; the frontend filtered the collection endpoint to
+			// work around it.
+			r.Get("/payments", paymentHandler.ListByDebt)
+		})
 	})
 
 	// Dashboard and analytics read the same tables and share one package; the
 	// split is only a URL grouping the frontend expects.
 	r.Route("/api/businesses", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/current", businessHandler.Get)
 		// Editing the profile is administrative: currency and the collection
 		// target shape every financial figure the business reports.
@@ -234,12 +326,14 @@ func main() {
 
 	r.Route("/api/onboarding", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/status", businessHandler.OnboardingStatus)
 		r.Post("/complete", businessHandler.OnboardingComplete)
 	})
 
 	r.Route("/api/dashboard", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/summary", analyticsHandler.Summary)
 		r.Get("/recent-debts", analyticsHandler.RecentDebts)
 		r.Get("/recent-payments", analyticsHandler.RecentPayments)
@@ -249,6 +343,7 @@ func main() {
 
 	r.Route("/api/analytics", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/collection-rate", analyticsHandler.CollectionRate)
 		r.Get("/risk-trend", analyticsHandler.RiskTrend)
 		r.Get("/customer-segments", analyticsHandler.CustomerSegments)
@@ -257,10 +352,52 @@ func main() {
 
 	r.Route("/api/payments", func(r chi.Router) {
 		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
 		r.Get("/", paymentHandler.List)
 		r.Post("/", paymentHandler.Create)
-		r.Get("/{paymentId}", paymentHandler.Get)
-		r.With(ownerOnly).Delete("/{paymentId}", paymentHandler.Delete)
+
+		r.Route("/{paymentId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("paymentId"))
+			r.Get("/", paymentHandler.Get)
+			// Correcting a payment moves money on the ledger exactly as
+			// recording one does, so it needs the same elevation as a debt edit.
+			r.With(ownerAdmin).Patch("/", paymentHandler.Update)
+			r.With(ownerOnly).Delete("/", paymentHandler.Delete)
+		})
+	})
+
+	// Team management. Until this route group existed the three roles were
+	// unreachable: register was the only caller of CreateUser, always as owner.
+	r.Route("/api/users", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
+		// Any member may see who their colleagues are; changing the team is not.
+		r.Get("/", userHandler.List)
+		r.With(ownerAdmin, originCheck, limitInvite).Post("/", userHandler.Invite)
+
+		r.Route("/{userId}", func(r chi.Router) {
+			r.Use(appmiddleware.ValidateUUIDParams("userId"))
+			r.Get("/", userHandler.Get)
+			r.With(ownerAdmin, originCheck).Patch("/", userHandler.Update)
+			// Removal is owner-only, one step above the rest of team
+			// management: it ends somebody's access outright.
+			r.With(ownerOnly, originCheck).Delete("/", userHandler.Remove)
+		})
+	})
+
+	// The audit trail is the record of who did what, so reading it is itself an
+	// administrative act — a member should not be able to study when the owner
+	// is usually working.
+	r.Route("/api/audit-logs", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
+		r.With(ownerAdmin).Get("/", auditHandler.List)
+	})
+
+	r.Route("/api/search", func(r chi.Router) {
+		r.Use(appmiddleware.RequireAuth(jwtSvc))
+		r.Use(limitAuthenticated)
+		r.Get("/", searchHandler.Search)
 	})
 
 	addr := ":" + port

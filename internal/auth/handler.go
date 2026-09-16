@@ -10,14 +10,24 @@ import (
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
+// Recorder writes the audit trail.
+//
+// It lives behind an interface because internal/audit already imports this
+// package for the request-context helpers — depending on it directly would be a
+// cycle. The consumer declaring its own narrow interface is what breaks it.
+type Recorder interface {
+	Record(r *http.Request, action, entityType string, entityID *string, metadata map[string]any)
+}
+
 type Handler struct {
 	svc        *Service
 	cookie     CookieConfig
 	refreshTTL time.Duration
+	recorder   Recorder
 }
 
-func NewHandler(svc *Service, cookie CookieConfig, refreshTTL time.Duration) *Handler {
-	return &Handler{svc: svc, cookie: cookie, refreshTTL: refreshTTL}
+func NewHandler(svc *Service, cookie CookieConfig, refreshTTL time.Duration, recorder Recorder) *Handler {
+	return &Handler{svc: svc, cookie: cookie, refreshTTL: refreshTTL, recorder: recorder}
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +151,11 @@ func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+
+	// Recorded without any part of either password: the trail needs to show
+	// that the credential changed and who changed it, nothing more.
+	h.recorder.Record(r, "auth.password_changed", "user", &userID, nil)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 

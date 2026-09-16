@@ -13,6 +13,11 @@ import (
 
 type Mailer interface {
 	SendPasswordReset(ctx context.Context, to, name, resetURL string) error
+	// SendInvitation carries the same kind of link as a password reset, but the
+	// recipient has no account yet and no idea why a "reset" mail arrived. The
+	// wording is the whole difference, so it is a separate method rather than a
+	// reused one.
+	SendInvitation(ctx context.Context, to, name, inviterName, setupURL string) error
 }
 
 // ConsoleMailer writes the message to the application log instead of sending
@@ -21,6 +26,13 @@ type Mailer interface {
 type ConsoleMailer struct{}
 
 func NewConsoleMailer() *ConsoleMailer { return &ConsoleMailer{} }
+
+func (m *ConsoleMailer) SendInvitation(_ context.Context, to, name, inviterName, setupURL string) error {
+	// Same caveat as below: a production mailer must never log this URL.
+	log.Printf("[mail] %s invited %s (%s) to CredFlow\n  set-password link: %s",
+		inviterName, name, to, setupURL)
+	return nil
+}
 
 func (m *ConsoleMailer) SendPasswordReset(_ context.Context, to, name, resetURL string) error {
 	// The link is logged deliberately: in development the operator IS the

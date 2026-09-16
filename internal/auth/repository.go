@@ -65,11 +65,14 @@ func (r *Repository) CreateUser(ctx context.Context, db DBTX, businessID, email,
 	return u, nil
 }
 
+// GetUserByEmail resolves a live user. Removed teammates are excluded here
+// rather than at the call sites, so no authentication path — login, refresh,
+// password reset — can forget the check and let a revoked account back in.
 func (r *Repository) GetUserByEmail(ctx context.Context, db DBTX, email string) (User, error) {
 	const q = `
 		SELECT id, business_id, email, name, role, password_hash, created_at, updated_at
 		FROM users
-		WHERE email = $1
+		WHERE email = $1 AND deleted_at IS NULL
 	`
 	var u User
 	err := db.QueryRow(ctx, q, email).
@@ -84,7 +87,7 @@ func (r *Repository) GetUserByID(ctx context.Context, db DBTX, id string) (User,
 	const q = `
 		SELECT id, business_id, email, name, role, password_hash, created_at, updated_at
 		FROM users
-		WHERE id = $1
+		WHERE id = $1 AND deleted_at IS NULL
 	`
 	var u User
 	err := db.QueryRow(ctx, q, id).
@@ -205,7 +208,7 @@ func (r *Repository) UpdateProfile(ctx context.Context, db DBTX, userID string, 
 		UPDATE users
 		SET name  = COALESCE($2, name),
 		    phone = CASE WHEN $3::boolean THEN NULLIF($4, '') ELSE phone END
-		WHERE id = $1
+		WHERE id = $1 AND deleted_at IS NULL
 		RETURNING id, business_id, email, name, role, password_hash, created_at, updated_at
 	`
 	// $3 says "phone was present in the request", so an explicit empty string
@@ -228,7 +231,7 @@ func (r *Repository) GetProfile(ctx context.Context, db DBTX, userID string) (Us
 	const q = `
 		SELECT id, business_id, email, name, role, password_hash, created_at, updated_at,
 		       COALESCE(phone, '')
-		FROM users WHERE id = $1
+		FROM users WHERE id = $1 AND deleted_at IS NULL
 	`
 	var u User
 	var phone string
@@ -242,7 +245,7 @@ func (r *Repository) GetProfile(ctx context.Context, db DBTX, userID string) (Us
 }
 
 func (r *Repository) UpdatePasswordHash(ctx context.Context, db DBTX, userID, hash string) error {
-	const q = `UPDATE users SET password_hash = $2 WHERE id = $1`
+	const q = `UPDATE users SET password_hash = $2 WHERE id = $1 AND deleted_at IS NULL`
 	tag, err := db.Exec(ctx, q, userID, hash)
 	if err != nil {
 		return err

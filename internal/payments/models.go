@@ -28,6 +28,21 @@ type CreateRequest struct {
 	IdempotencyKey string  `json:"idempotencyKey"` // empty = no guard
 }
 
+// UpdateRequest corrects a recorded payment. Pointers, so an omitted key is
+// left unchanged.
+//
+// CustomerID and DebtID are absent on purpose. Re-pointing a payment at a
+// different debt would silently change two balances at once, and the honest way
+// to express that is to void the payment and record it again — which leaves
+// both actions in the audit trail instead of one opaque edit.
+type UpdateRequest struct {
+	Amount    *float64 `json:"amount,omitempty"`
+	Method    *string  `json:"method,omitempty"`
+	Reference *string  `json:"reference,omitempty"`
+	Notes     *string  `json:"notes,omitempty"`
+	PaidAt    *string  `json:"paidAt,omitempty"` // RFC3339
+}
+
 type ListQuery struct {
 	Page       int
 	PageSize   int

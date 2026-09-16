@@ -5,15 +5,25 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/Justdan111/credflow-api/internal/audit"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
 type Handler struct {
-	svc *Service
+	svc      *Service
+	recorder Recorder
 }
 
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+// Recorder writes the audit trail. Declared as an interface here so this
+// package does not depend on how the audit service is constructed.
+type Recorder interface {
+	Record(r *http.Request, action, entityType string, entityID *string, metadata map[string]any)
+}
+
+func NewHandler(svc *Service, recorder Recorder) *Handler {
+	return &Handler{svc: svc, recorder: recorder}
+}
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	businessID, ok := auth.BusinessIDFromContext(r.Context())
@@ -59,6 +69,8 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			writeServiceError(w, err)
 			return
 		}
+		h.recorder.Record(r, audit.ActionBusinessUpdated, audit.EntityBusiness, &businessID,
+			map[string]any{"monthlyCollectionTarget": nil})
 		response.Success(w, http.StatusOK, out)
 		return
 	}
@@ -68,6 +80,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	// The currency and collection target shape every figure this business
+	// reports, so a change to either needs to be attributable.
+	h.recorder.Record(r, audit.ActionBusinessUpdated, audit.EntityBusiness, &businessID,
+		map[string]any{"currency": out.Currency, "monthlyCollectionTarget": out.MonthlyCollectionTarget})
 	response.Success(w, http.StatusOK, out)
 }
 

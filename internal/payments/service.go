@@ -76,6 +76,53 @@ func (s *Service) Create(ctx context.Context, businessID string, req CreateReque
 	return out, replay, nil
 }
 
+// Update corrects a recorded payment and recomputes its debt, both inside one
+// transaction.
+//
+// Changing the amount moves a debt between pending, partial and paid, so the
+// recompute is not optional — without it a corrected payment would leave the
+// ledger reporting a status the numbers no longer support. That is the same
+// invariant Create and Delete maintain, which is why all three go through
+// RecomputeDebtStatus rather than each deciding a status for themselves.
+func (s *Service) Update(ctx context.Context, businessID, id string, req UpdateRequest) (Payment, error) {
+	if req.Amount != nil && *req.Amount <= 0 {
+		return Payment{}, fmt.Errorf("%w: amount must be greater than 0", ErrValidation)
+	}
+	if req.Method != nil {
+		if _, ok := allowedMethods[*req.Method]; !ok {
+			return Payment{}, fmt.Errorf("%w: method must be one of cash, card, bank_transfer, check, mobile_money, other", ErrValidation)
+		}
+	}
+
+	var paidAt *time.Time
+	if req.PaidAt != nil {
+		t, err := parsePaidAt(*req.PaidAt)
+		if err != nil {
+			return Payment{}, err
+		}
+		paidAt = &t
+	}
+
+	var out Payment
+	txErr := pgx.BeginFunc(ctx, s.repo.Pool(), func(tx pgx.Tx) error {
+		updated, err := s.repo.Update(ctx, tx, businessID, id, req, paidAt)
+		if err != nil {
+			return err
+		}
+		out = updated
+		if updated.DebtID != nil {
+			if err := s.repo.RecomputeDebtStatus(ctx, tx, businessID, *updated.DebtID); err != nil {
+				return fmt.Errorf("recompute debt status: %w", err)
+			}
+		}
+		return nil
+	})
+	if txErr != nil {
+		return Payment{}, txErr
+	}
+	return out, nil
+}
+
 func (s *Service) Get(ctx context.Context, businessID, id string) (Payment, error) {
 	return s.repo.Get(ctx, businessID, id)
 }

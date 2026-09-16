@@ -7,16 +7,33 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Justdan111/credflow-api/internal/audit"
 	"github.com/Justdan111/credflow-api/internal/auth"
 	"github.com/Justdan111/credflow-api/pkg/response"
 )
 
 type Handler struct {
-	svc *Service
+	svc      *Service
+	recorder Recorder
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+// Recorder writes the audit trail. Declared as an interface here so this
+// package does not depend on how the audit service is constructed.
+type Recorder interface {
+	Record(r *http.Request, action, entityType string, entityID *string, metadata map[string]any)
+}
+
+func NewHandler(svc *Service, recorder Recorder) *Handler {
+	return &Handler{svc: svc, recorder: recorder}
+}
+
+// recordDebt writes one entry, carrying the figures that make it readable later.
+func (h *Handler) recordDebt(r *http.Request, action string, d Debt) {
+	h.recorder.Record(r, action, audit.EntityDebt, &d.ID, map[string]any{
+		"amount":     d.Amount,
+		"customerId": d.CustomerID,
+		"status":     d.Status,
+	})
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +83,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	h.recordDebt(r, audit.ActionDebtUpdated, d)
 	response.Success(w, http.StatusOK, d)
 }
 
@@ -75,10 +93,20 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		response.Fail(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	if err := h.svc.Delete(r.Context(), businessID, chi.URLParam(r, "debtId")); err != nil {
+	debtID := chi.URLParam(r, "debtId")
+
+	// Read before deleting, so the entry can record what was written off.
+	deleted, err := h.svc.Get(r.Context(), businessID, debtID)
+	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
+
+	if err := h.svc.Delete(r.Context(), businessID, debtID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	h.recordDebt(r, audit.ActionDebtDeleted, deleted)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -93,6 +121,9 @@ func (h *Handler) MarkPaid(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	// Closing a debt without money changing hands is an administrative write-off
+	// — exactly the kind of decision an audit trail exists to attribute.
+	h.recordDebt(r, audit.ActionDebtMarkedPaid, d)
 	response.Success(w, http.StatusOK, d)
 }
 

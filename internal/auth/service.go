@@ -62,6 +62,7 @@ type Service struct {
 // mailer is chosen in main.go, and tests can substitute a recorder.
 type Mailer interface {
 	SendPasswordReset(ctx context.Context, to, name, resetURL string) error
+	SendInvitation(ctx context.Context, to, name, inviterName, setupURL string) error
 }
 
 func NewService(db *pgxpool.Pool, repo *Repository, jwt *JWTService, refreshTTL, absoluteTTL time.Duration, m Mailer, appBaseURL string, resetTTL time.Duration) *Service {
@@ -258,6 +259,40 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) e
 	})
 }
 
+// SendInvitation issues a single-use link for a newly invited teammate to set
+// their first password, and satisfies users.Inviter.
+//
+// It deliberately reuses the password-reset token: same entropy, same single-use
+// rule, same expiry, same redemption path. A separate "invitation token" would
+// be a second credential type with its own chance of getting one of those wrong,
+// to solve a problem the first one already solves.
+//
+// Unlike ForgotPassword this returns delivery errors. There is no enumeration
+// concern — the caller just created the account and knows it exists — and an
+// admin who invites somebody wants to know the mail did not go out.
+func (s *Service) SendInvitation(ctx context.Context, userID, email, name, invitedByName string) error {
+	plain, err := NewResetToken()
+	if err != nil {
+		return err
+	}
+
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		// Re-inviting must burn the previous link, exactly as a second
+		// forgot-password request does.
+		if err := s.repo.InvalidateResetTokens(ctx, tx, userID); err != nil {
+			return err
+		}
+		return s.repo.CreateResetToken(ctx, tx, userID,
+			HashResetToken(plain), time.Now().Add(s.resetTTL))
+	})
+	if err != nil {
+		return err
+	}
+
+	link := fmt.Sprintf("%s/reset-password?token=%s", s.appBaseURL, plain)
+	return s.mailer.SendInvitation(ctx, email, name, invitedByName, link)
+}
+
 // CleanupExpiredResetTokens is called by the existing daily job.
 func (s *Service) CleanupExpiredResetTokens(ctx context.Context, grace time.Duration) (int64, error) {
 	return s.repo.DeleteExpiredResetTokens(ctx, s.db, grace)
@@ -328,6 +363,13 @@ func (s *Service) Refresh(ctx context.Context, plain, userAgent string) (AuthRes
 
 		user, err := s.repo.GetUserByID(ctx, tx, claimed.UserID)
 		if err != nil {
+			// The account was removed while this session was live. Removal
+			// revokes its tokens, so the claim above normally fails first;
+			// this is the backstop, and it must read as a dead session rather
+			// than as a missing resource.
+			if errors.Is(err, ErrUserNotFound) {
+				return ErrInvalidRefreshToken
+			}
 			return err
 		}
 		biz, err := s.repo.GetBusinessByID(ctx, tx, user.BusinessID)
