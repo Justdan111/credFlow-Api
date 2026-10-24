@@ -52,9 +52,9 @@ func main() {
 	jwtTTL := envDuration("JWT_TTL", 15*time.Minute)
 	refreshTTL := envDuration("REFRESH_TTL", 30*24*time.Hour)
 	refreshAbsoluteTTL := envDuration("REFRESH_ABSOLUTE_TTL", 90*24*time.Hour)
-	allowedOrigins := envCSV("ALLOWED_ORIGINS", []string{"http://localhost:5173"})
+	allowedOrigins := envCSV("ALLOWED_ORIGINS", []string{"http://localhost:3000"})
 	cookieSecure := envBool("COOKIE_SECURE", true)
-	appBaseURL := envString("APP_BASE_URL", "http://localhost:5173")
+	appBaseURL := envString("APP_BASE_URL", "http://localhost:3000")
 	// Short by design: a reset link is a bearer credential for taking over an
 	// account, so it should not sit valid in an inbox for long.
 	resetTTL := envDuration("PASSWORD_RESET_TTL", time.Hour)
