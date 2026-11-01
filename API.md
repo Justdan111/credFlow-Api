@@ -122,7 +122,7 @@ implementation logs the link to the application log, so the whole flow works in
 development with no external service. A real provider is one type satisfying the same
 interface, wired in `cmd/server/main.go`.
 
-`APP_BASE_URL` (default `http://localhost:5173`) builds the link the frontend consumes.
+`APP_BASE_URL` (default `http://localhost:3000`) builds the link the frontend consumes.
 
 ### CORS
 
