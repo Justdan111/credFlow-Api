@@ -341,6 +341,7 @@ covering every route, each privilege rule, tenant isolation, and the security
 behaviours (a spoofed `X-Forwarded-For` must not reset a limit; a second user
 behind one address must be unaffected by the first).
 
+
 > Integration tests **skip** rather than fail when the database is unreachable.
 > A green `make test-all` on a machine with no Docker means *nothing ran* —
 > check the output for `SKIP` before trusting it.
